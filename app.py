@@ -1,14 +1,16 @@
-import streamlit as st
-import pandas as pd
+from __future__ import annotations
+
 import numpy as np
+import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import streamlit as st
+from sklearn.linear_model import LinearRegression
 import requests
 
-# Set page configuration
-st.set_page_config(page_title="GridSight Microgrid Dashboard", layout="wide")
+st.set_page_config(page_title="GridSight", layout="wide", page_icon="⚡")
 
-# --- LIVE API INTEGRATION ---
+
 def fetch_live_aqi(city_name: str, token: str) -> float:
     city_mapping = {
         "Pune Industrial Campus": "pune",
@@ -17,7 +19,7 @@ def fetch_live_aqi(city_name: str, token: str) -> float:
     }
     query_city = city_mapping.get(city_name, "kolkata")
     url = f"https://api.waqi.info/feed/{query_city}/?token={token}"
-
+    
     try:
         response = requests.get(url, timeout=5)
         if response.status_code == 200:
@@ -28,47 +30,56 @@ def fetch_live_aqi(city_name: str, token: str) -> float:
         pass
     return 75.0  # Fallback default value if internet fails
 
-def generate_site_data(days: int, seed: int):
-    np.random.seed(seed)
-    future_ts = pd.date_range(end=pd.Timestamp.now(), periods=days * 48, freq='30min')
-    hour = future_ts.hour.to_numpy()
-    baseline_load = 120 + 25 * np.sin(2 * np.pi * hour / 24) + 15 * (future_ts.dayofweek < 5).astype(int)
-    load_noise = np.random.normal(0, 5, len(future_ts))
-    load_kw = np.clip(baseline_load + load_noise, 80, 200)
 
-    solar_baseline = np.maximum(0, 92 * np.sin(np.pi * (hour - 6) / 12))
-    solar_baseline[hour < 6] = 0
-    solar_baseline[hour > 18] = 0
-    solar_kw = np.clip(solar_baseline * np.random.uniform(0.85, 1.0, len(future_ts)), 0, 92)
+def generate_site_data(days: int, seed: int) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    periods = days * 48
+    timestamp = pd.date_range(end=pd.Timestamp.now().floor("30min"), periods=periods, freq="30min")
+    hour = timestamp.hour + timestamp.minute / 60
+    weekday = timestamp.dayofweek
 
-    aqi = np.clip(100 + 40 * np.sin(2 * np.pi * future_ts.dayofyear / 365) + np.random.normal(0, 20, len(future_ts)), 30, 300)
-    temperature = 28 + 6 * np.sin(2 * np.pi * (hour - 9) / 24) + np.random.normal(0, 1.5, len(future_ts))
-    irradiance = np.maximum(0, 1000 * np.sin(np.pi * (hour - 6) / 12))
-    irradiance[hour < 6] = 0
-    irradiance[hour > 18] = 0
+    base_load = 140 + 35 * np.sin(2 * np.pi * (hour - 8) / 24) + 20 * np.sin(2 * np.pi * (hour - 18) / 24)
+    weekday_factor = np.where(weekday < 5, 1.0, 0.82)
+    load_noise = rng.normal(0, 6, periods)
+    load_kw = np.clip(base_load * weekday_factor + load_noise, 40, None)
+
+    irradiance = np.clip(900 * np.sin(np.pi * (hour - 6) / 12), 0, None)
+    irradiance = np.clip(irradiance + rng.normal(0, 25, periods), 0, 1000)
+
+    temperature = 24 + 8 * np.sin(2 * np.pi * (hour - 9) / 24) + rng.normal(0, 1.2, periods)
+
+    aqi_base = 90 + 40 * np.sin(2 * np.pi * (hour - 7) / 24) + rng.normal(0, 15, periods)
+    aqi = np.clip(aqi_base, 15, 320)
+
+    panel_derate = np.clip(1 - np.clip(temperature - 25, 0, None) * 0.004, 0.85, 1)
+    dust_derate = np.clip(1 - np.clip(aqi - 45, 0, None) * 0.00075, 0.7, 1)
+    solar_kw = np.clip(irradiance / 1000 * 92 * panel_derate * dust_derate, 0, 92)
 
     return pd.DataFrame({
-        "timestamp": future_ts,
+        "timestamp": timestamp,
         "load_kw": load_kw,
         "solar_kw": solar_kw,
         "aqi": aqi,
+        "irradiance": irradiance,
         "temperature": temperature,
-        "irradiance": irradiance
     })
 
-def forecast_load(train, horizon_steps: int, temp_shift: float):
-    future_ts = pd.date_range(start=train.timestamp.iloc[-1] + pd.Timedelta('30min'), periods=horizon_steps, freq='30min')
-    baseline_temp = 30 + temp_shift
-    from sklearn.linear_model import LinearRegression
+
+def forecast_load(train: pd.DataFrame, horizon_periods: int, weather_shift: float) -> pd.DataFrame:
     features = pd.DataFrame({
-        "hour": train.timestamp.dt.hour,
+        "hour": train.timestamp.dt.hour + train.timestamp.dt.minute / 60,
         "weekday": (train.timestamp.dt.dayofweek < 5).astype(int),
-        "temperature": train.temperature
+        "temperature": train.temperature,
     })
-    model = LinearRegression().fit(features, train.load_kw)
+    model = LinearRegression()
+    model.fit(features, train.load_kw)
+
+    last_ts = train.timestamp.iloc[-1]
+    future_ts = pd.date_range(start=last_ts + pd.Timedelta(minutes=30), periods=horizon_periods, freq="30min")
+    baseline_temp = train.temperature.iloc[-48:].mean() + weather_shift
 
     future = pd.DataFrame({
-        "hour": future_ts.hour,
+        "hour": future_ts.hour + future_ts.minute / 60,
         "weekday": (future_ts.dayofweek < 5).astype(int),
         "temperature": baseline_temp + 3 * np.sin(2 * np.pi * (future_ts.hour - 8) / 24),
     })
@@ -76,6 +87,7 @@ def forecast_load(train, horizon_steps: int, temp_shift: float):
     residual = train.load_kw - model.predict(features)
     band = max(7, residual.std() * 1.96)
     return pd.DataFrame({"timestamp": future_ts, "forecast_kw": prediction, "lower": prediction - band, "upper": prediction + band})
+
 
 def aqi_label(value: float) -> tuple[str, str]:
     if value <= 50:
@@ -85,6 +97,7 @@ def aqi_label(value: float) -> tuple[str, str]:
     if value <= 200:
         return "Moderate", "#ffc857"
     return "Poor", "#f47c67"
+
 
 st.markdown("""
 <style>
@@ -107,8 +120,8 @@ with st.sidebar:
     weather_shift = st.slider("Temperature scenario", -4, 6, 0, help="Adjusts forecast demand for a warmer or cooler outlook.")
     st.divider()
     st.caption("Data mode")
-
-    # Dynamic status check for Live API vs Simulation
+    
+    # Dynamic status indicator for API connection
     try:
         _ = st.secrets["WAQI_TOKEN"]
         st.info("Live API connected", icon="🟢")
@@ -118,7 +131,7 @@ with st.sidebar:
 data = generate_site_data(days, 42)
 latest = data.iloc[-1].copy()
 
-# Pull live AQI if token exists
+# Try overwriting AQI with live API feed using the stored secret token
 try:
     token = st.secrets["WAQI_TOKEN"]
     latest["aqi"] = fetch_live_aqi(site, token)
@@ -185,5 +198,5 @@ with st.expander("Data model and integration notes"):
     st.markdown("""
     **Current model:** synthetic 30-minute site observations; demand is forecast with a seasonal linear regression. Solar output accounts for irradiance, panel temperature, and an AQI-derived dust-loss proxy.
 
-    **Production connection points:** live WAQI API integration active for air quality metrics; smart-meter/SCADA telemetry mapped to core microgrid variables.
+    **Production connection points:** live WAQI API feed integrated for real-time air quality tracking; smart-meter and meteorological weather telemetry mapped to core microgrid metrics.
     """)
