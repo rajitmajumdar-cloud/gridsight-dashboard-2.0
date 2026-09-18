@@ -10,11 +10,26 @@ import requests
 
 st.set_page_config(page_title="GridSight", layout="wide", page_icon="⚡")
 
-# Site-specific configuration profiles
+# Comprehensive site configuration profiles with distinct load profile characteristics
 SITE_CONFIGS = {
-    "Pune Industrial Campus": {"capacity_kw": 92.0, "base_load": 140.0, "aqi_offset": 10},
-    "Bengaluru Tech Park": {"capacity_kw": 120.0, "base_load": 110.0, "aqi_offset": -20},
-    "Delhi Commercial Hub": {"capacity_kw": 75.0, "base_load": 165.0, "aqi_offset": 50}
+    "Pune Industrial Campus": {
+        "capacity_kw": 92.0, 
+        "base_load": 140.0, 
+        "aqi_offset": 10,
+        "profile_type": "industrial" # Flat midday continuous operation
+    },
+    "Bengaluru Tech Park": {
+        "capacity_kw": 120.0, 
+        "base_load": 110.0, 
+        "aqi_offset": -20,
+        "profile_type": "tech" # Sharp morning/evening office peaks
+    },
+    "Delhi Commercial Hub": {
+        "capacity_kw": 75.0, 
+        "base_load": 165.0, 
+        "aqi_offset": 50,
+        "profile_type": "commercial" # Heavy afternoon cooling peak
+    }
 }
 
 
@@ -41,6 +56,7 @@ def fetch_live_aqi(city_name: str, token: str) -> tuple[float, str]:
 def generate_site_data(site_name: str, days: int, seed: int) -> pd.DataFrame:
     config = SITE_CONFIGS.get(site_name, SITE_CONFIGS["Pune Industrial Campus"])
     capacity = config["capacity_kw"]
+    p_type = config["profile_type"]
     
     rng = np.random.default_rng(seed)
     periods = days * 48
@@ -48,9 +64,19 @@ def generate_site_data(site_name: str, days: int, seed: int) -> pd.DataFrame:
     hour = timestamp.hour + timestamp.minute / 60
     weekday = timestamp.dayofweek
 
-    base_load = config["base_load"] + 35 * np.sin(2 * np.pi * (hour - 8) / 24) + 20 * np.sin(2 * np.pi * (hour - 18) / 24)
-    weekday_factor = np.where(weekday < 5, 1.0, 0.82)
-    load_noise = rng.normal(0, 5, periods)
+    # Distinct site load profiles
+    if p_type == "industrial":
+        # Flatter industrial profile with steady continuous load
+        base_load = config["base_load"] + 15 * np.sin(2 * np.pi * hour / 24) + 10 * np.cos(2 * np.pi * hour / 12)
+    elif p_type == "tech":
+        # Sharp office entry/exit peaks around 9am and 6pm
+        base_load = config["base_load"] + 45 * np.exp(-((hour - 9.5)**2) / 4) + 40 * np.exp(-((hour - 18.5)**2) / 3)
+    else:
+        # Commercial hub with massive afternoon HVAC cooling peak
+        base_load = config["base_load"] + 55 * np.sin(np.pi * (hour - 8) / 12) * np.where((hour >= 8) & (hour <= 20), 1, 0.3)
+
+    weekday_factor = np.where(weekday < 5, 1.0, 0.75)
+    load_noise = rng.normal(0, 4, periods)
     load_kw = np.clip(base_load * weekday_factor + load_noise, 30, None)
 
     irradiance = np.clip(950 * np.sin(np.pi * (hour - 6) / 12), 0, None)
@@ -125,7 +151,6 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# URL query parameters state reading & synchronization
 query_params = st.query_params
 default_site = query_params.get("site", "Pune Industrial Campus")
 if default_site not in SITE_CONFIGS:
@@ -137,8 +162,6 @@ with st.sidebar:
     
     site_options = list(SITE_CONFIGS.keys())
     site = st.selectbox("Site", site_options, index=site_options.index(default_site))
-    
-    # Write selected site back to query params for shareable state
     st.query_params["site"] = site
 
     days = st.slider("Historical data window (Days)", 7, 60, 21)
@@ -193,6 +216,7 @@ except Exception:
 forecast, res_std = forecast_load(data, horizon_hours * 2, weather_shift)
 baseline_forecast, _ = forecast_load(data, horizon_hours * 2, 0)
 peak_diff = forecast.forecast_kw.max() - baseline_forecast.forecast_kw.max()
+energy_diff_pct = ((forecast.forecast_kw.sum() - baseline_forecast.forecast_kw.sum()) / baseline_forecast.forecast_kw.sum()) * 100
 
 aqi_text, aqi_color = aqi_label(latest.aqi)
 solar_loss = max(0, (latest.aqi - 45) * 0.075)
@@ -213,25 +237,34 @@ with st.sidebar:
 st.markdown(f"# {site}  ")
 st.caption(f"LIVE OPERATIONS VIEW  •  Source: {data_source_status}  •  Refreshed: {pd.Timestamp.now().strftime('%H:%M:%S')}")
 
+# Enhanced Multi-State Annunciator Status Strip
 active_alerts = []
-if latest.aqi > 150:
-    active_alerts.append(("🔴 High Particulate Warning", f"Severe AQI levels ({latest.aqi:.0f}) detected. Active solar soiling derate applied."))
+if latest.aqi > 200:
+    active_alerts.append(("🔴 CRITICAL AQI WARNING", f"Severe particulate pollution ({latest.aqi:.0f} AQI). Maximum soiling derate applied."))
+elif latest.aqi > 150:
+    active_alerts.append(("🟠 Elevated AQI Notice", f"Moderate-high particulate levels ({latest.aqi:.0f} AQI). Soiling derate active."))
+
 if weather_shift != 0:
-    active_alerts.append(("🌡️ Thermal Scenario Active", f"{weather_shift:+.1f}°C temperature shift applied to predictive load models."))
-if latest.load_kw > (SITE_CONFIGS[site]["base_load"] * 1.1):
-    active_alerts.append(("⚡ High Demand Event", f"Current grid load ({latest.load_kw:.0f} kW) is elevated above baseline profile."))
+    active_alerts.append(("🌡️ Thermal Scenario Active", f"{weather_shift:+.1f}°C temperature shift causing a {peak_diff:+.1f} kW peak variance."))
+
+if latest.load_kw > (SITE_CONFIGS[site]["base_load"] * 1.15):
+    active_alerts.append(("⚡ High Load Event", f"Current site demand ({latest.load_kw:.0f} kW) is significantly elevated."))
 
 if active_alerts:
     for title, msg in active_alerts:
-        st.warning(f"**{title}:** {msg}")
+        if "CRITICAL" in title:
+            st.error(f"**{title}:** {msg}")
+        else:
+            st.warning(f"**{title}:** {msg}")
 else:
-    st.success("🟢 **System Status Normal:** All microgrid telemetry parameters operating within optimal parameters.", icon="✅")
+    st.success("🟢 **System Status Normal:** All microgrid telemetry parameters operating within optimal bounds.", icon="✅")
 
 cards = st.columns(4)
 current_capacity_factor = (latest.solar_kw / site_capacity) * 100
+solar_note = f"{current_capacity_factor:.0f}% capacity factor ({site_capacity:.0f} kW cap)" if latest.irradiance >= 10.0 else "🌙 Night Mode (Solar Gated)"
 metrics = [
     ("Grid demand", f"{latest.load_kw:.0f} kW", "↗ 3.2% vs yesterday", "#71d5c1"),
-    ("Solar output", f"{latest.solar_kw:.1f} kW", f"{current_capacity_factor:.0f}% capacity factor ({site_capacity:.0f} kW cap)", "#ffd166"),
+    ("Solar output", f"{latest.solar_kw:.1f} kW", solar_note, "#ffd166"),
     ("Air quality", f"{latest.aqi:.0f} AQI", aqi_text, aqi_color),
     ("Net grid import", f"{net_load:.0f} kW", "after on-site generation", "#a9c7ff"),
 ]
@@ -258,7 +291,7 @@ with right:
     peak = forecast.loc[forecast.forecast_kw.idxmax()]
     st.markdown("#### Forecast signal")
     
-    delta_text = f"{peak_diff:+.1f} kW vs base" if weather_shift != 0 else peak.timestamp.strftime("%H:%M tomorrow")
+    delta_text = f"{peak_diff:+.1f} kW peak ({energy_diff_pct:+.1f}% energy)" if weather_shift != 0 else peak.timestamp.strftime("%H:%M tomorrow")
     st.metric("Expected peak", f"{peak.forecast_kw:.0f} kW", delta=delta_text)
     st.metric("Forecast energy", f"{forecast.forecast_kw.sum() / 2:.1f} kWh")
     
@@ -287,11 +320,18 @@ with col2:
     st.progress(int(performance_ratio), text=f"Performance Ratio (PR): {performance_ratio:.1f}%")
     st.metric("AQI-related soiling loss", f"{solar_loss:.1f}%", "modeled dust derate")
     st.metric("Cell temperature", f"{latest.temperature:.1f} °C")
-    st.warning("Schedule a panel wash within 48 hours" if latest.aqi > 150 else "Conditions are optimal for current operation", icon="🧽")
+    
+    # Irradiance-aware maintenance recommendation logic
+    if latest.irradiance < 10.0:
+        st.info("🌙 Night Mode: Panel maintenance alerts suppressed during low irradiance.", icon="ℹ️")
+    elif latest.aqi > 150:
+        st.warning("Schedule a panel wash within 48 hours due to high particulate soiling.", icon="🧽")
+    else:
+        st.success("Conditions are optimal for current operation.", icon="✅")
 
 with st.expander("Data model and integration notes"):
     st.markdown(f"""
-    **Current architecture & site config:** 30-minute resolution telemetry configured for **{site}** ({site_capacity:.0f} kW nameplate solar capacity). Load forecasting uses a multivariable linear regression model incorporating time-of-day, day-of-week, and ambient temperature features. 
+    **Current architecture & site config:** 30-minute resolution telemetry configured for **{site}** ({site_capacity:.0f} kW nameplate solar capacity, profile: {SITE_CONFIGS[site]["profile_type"]}). Load forecasting uses a multivariable linear regression model incorporating time-of-day, day-of-week, and ambient temperature features. 
 
     **Solar & Environmental Modeling:** Photovoltaic output includes strict nighttime irradiance gating (< 10 W/m² cutoff) and is dynamically derated using real-time cell temperature coefficients and particulate soiling proxies mapped from live AQI feeds.
     """)
