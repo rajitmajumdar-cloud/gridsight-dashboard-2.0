@@ -181,7 +181,6 @@ with st.sidebar:
 st.markdown(f"# {site}  ")
 st.caption(f"LIVE OPERATIONS VIEW  •  Source: {data_source_status}  •  Refreshed: {pd.Timestamp.now().strftime('%H:%M:%S')}")
 
-# Operational Alert Strip Logic
 active_alerts = []
 if latest.aqi > 150:
     active_alerts.append(("🔴 High Particulate Warning", f"Severe AQI levels ({latest.aqi:.0f}) detected. Active solar soiling derate applied."))
@@ -215,7 +214,13 @@ with left:
     fig.add_trace(go.Scatter(x=recent.timestamp, y=recent.load_kw, name="Actual demand", line=dict(color="#5ad1e5", width=2)))
     fig.add_trace(go.Scatter(x=forecast.timestamp, y=forecast.upper, line=dict(width=0), showlegend=False, hoverinfo="skip"))
     fig.add_trace(go.Scatter(x=forecast.timestamp, y=forecast.lower, fill="tonexty", fillcolor="rgba(92, 183, 191, .16)", line=dict(width=0), name="95% confidence", hoverinfo="skip"))
-    fig.add_trace(go.Scatter(x=forecast.timestamp, y=forecast.forecast_kw, name="Forecast", line=dict(color="#ffc857", dash="dash", width=2.5)))
+    
+    # If a temperature shift is active, plot baseline forecast as a comparison overlay trace
+    if weather_shift != 0:
+        fig.add_trace(go.Scatter(x=baseline_forecast.timestamp, y=baseline_forecast.forecast_kw, name="Baseline (0°C)", line=dict(color="#a9c7ff", dash="dot", width=1.8)))
+        
+    fig.add_trace(go.Scatter(x=forecast.timestamp, y=forecast.forecast_kw, name=f"Scenario ({weather_shift:+.1f}°C)" if weather_shift != 0 else "Forecast", line=dict(color="#ffc857", dash="dash", width=2.5)))
+    
     fig.update_layout(template="plotly_dark", height=360, margin=dict(l=12,r=12,t=20,b=10), paper_bgcolor="#0b1d2b", plot_bgcolor="#0b1d2b", legend=dict(orientation="h", y=1.12), yaxis_title="kW", xaxis_title=None)
     st.plotly_chart(fig, use_container_width=True)
 with right:
