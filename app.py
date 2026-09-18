@@ -28,7 +28,7 @@ def fetch_live_aqi(city_name: str, token: str) -> float:
                 return float(payload["data"]["aqi"])
     except Exception:
         pass
-    return 75.0  # Fallback default value if internet fails
+    return 75.0  # Fallback default value
 
 
 def generate_site_data(days: int, seed: int) -> pd.DataFrame:
@@ -65,7 +65,7 @@ def generate_site_data(days: int, seed: int) -> pd.DataFrame:
     })
 
 
-def forecast_load(train: pd.DataFrame, horizon_periods: int, weather_shift: float) -> pd.DataFrame:
+def forecast_load(train: pd.DataFrame, horizon_periods: int, weather_shift: float) -> tuple[pd.DataFrame, float]:
     features = pd.DataFrame({
         "hour": train.timestamp.dt.hour + train.timestamp.dt.minute / 60,
         "weekday": (train.timestamp.dt.dayofweek < 5).astype(int),
@@ -86,7 +86,9 @@ def forecast_load(train: pd.DataFrame, horizon_periods: int, weather_shift: floa
     prediction = model.predict(future)
     residual = train.load_kw - model.predict(features)
     band = max(7, residual.std() * 1.96)
-    return pd.DataFrame({"timestamp": future_ts, "forecast_kw": prediction, "lower": prediction - band, "upper": prediction + band})
+    
+    forecast_df = pd.DataFrame({"timestamp": future_ts, "forecast_kw": prediction, "lower": prediction - band, "upper": prediction + band})
+    return forecast_df, residual.std()
 
 
 def aqi_label(value: float) -> tuple[str, str]:
@@ -117,11 +119,17 @@ with st.sidebar:
     site = st.selectbox("Site", ["Pune Industrial Campus", "Bengaluru Tech Park", "Delhi Commercial Hub"])
     days = st.slider("Historical data window", 7, 60, 21)
     horizon_hours = st.select_slider("Forecast horizon", options=[12, 24, 36, 48, 72], value=24)
+    
+    # Quantified temperature slider with dynamic caption feedback
     weather_shift = st.slider("Temperature scenario", -4, 6, 0, help="Adjusts forecast demand for a warmer or cooler outlook.")
+    if weather_shift != 0:
+        st.caption(f"🌡️ Thermal Scenario: {'+' if weather_shift > 0 else ''}{weather_shift}°C shift applied to baseline demand.")
+    else:
+        st.caption("🌡️ Baseline temperature profile active.")
+        
     st.divider()
     st.caption("Data mode")
     
-    # Dynamic status indicator for API connection
     try:
         _ = st.secrets["WAQI_TOKEN"]
         st.info("Live API connected", icon="🟢")
@@ -131,14 +139,17 @@ with st.sidebar:
 data = generate_site_data(days, 42)
 latest = data.iloc[-1].copy()
 
-# Try overwriting AQI with live API feed using the stored secret token
 try:
     token = st.secrets["WAQI_TOKEN"]
     latest["aqi"] = fetch_live_aqi(site, token)
 except Exception:
     pass
 
-forecast = forecast_load(data, horizon_hours * 2, weather_shift)
+# Run forecasts for current scenario and a baseline 0-shift scenario to quantify impact
+forecast, res_std = forecast_load(data, horizon_hours * 2, weather_shift)
+baseline_forecast, _ = forecast_load(data, horizon_hours * 2, 0)
+peak_diff = forecast.forecast_kw.max() - baseline_forecast.forecast_kw.max()
+
 aqi_text, aqi_color = aqi_label(latest.aqi)
 solar_loss = max(0, (latest.aqi - 45) * 0.075)
 net_load = latest.load_kw - latest.solar_kw
@@ -156,7 +167,7 @@ metrics = [
 for col, (label, value, note, color) in zip(cards, metrics):
     col.markdown(f'<div class="metric-card"><div class="metric-label">{label}</div><div class="metric-value">{value}</div><div class="metric-note" style="color:{color}">{note}</div></div>', unsafe_allow_html=True)
 
-st.markdown("### Demand outlook")
+st.markdown("### Demand outlook & ML forecasting")
 left, right = st.columns([2.1, 1])
 with left:
     recent = data.tail(144)
@@ -170,9 +181,12 @@ with left:
 with right:
     peak = forecast.loc[forecast.forecast_kw.idxmax()]
     st.markdown("#### Forecast signal")
-    st.metric("Expected peak", f"{peak.forecast_kw:.0f} kW", peak.timestamp.strftime("%H:%M tomorrow"))
+    st.metric("Expected peak", f"{peak.forecast_kw:.0f} kW", peak.timestamp.strftime("%H:%M tomorrow"), delta=f"{peak_diff:+.1f} kW vs base" if weather_shift != 0 else None)
     st.metric("Forecast energy", f"{forecast.forecast_kw.sum() / 2:.1f} kWh")
-    st.caption("Forecast uses time-of-day, weekday and temperature signals. Shaded band reflects recent model residuals.")
+    
+    # Model Transparency Box
+    st.markdown("---")
+    st.caption(f"⚙️ **Model Info:** Scikit-Learn Linear Regression\n\n📊 **Window:** {days} Days history | **Residual Std:** ±{res_std:.1f} kW")
 
 st.markdown("### Solar performance & environmental impact")
 col1, col2 = st.columns([1.5, 1])
