@@ -125,10 +125,22 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# URL query parameters state reading & synchronization
+query_params = st.query_params
+default_site = query_params.get("site", "Pune Industrial Campus")
+if default_site not in SITE_CONFIGS:
+    default_site = "Pune Industrial Campus"
+
 with st.sidebar:
     st.markdown("## ⚡ GridSight")
     st.caption("Microgrid command center")
-    site = st.selectbox("Site", list(SITE_CONFIGS.keys()))
+    
+    site_options = list(SITE_CONFIGS.keys())
+    site = st.selectbox("Site", site_options, index=site_options.index(default_site))
+    
+    # Write selected site back to query params for shareable state
+    st.query_params["site"] = site
+
     days = st.slider("Historical data window (Days)", 7, 60, 21)
     horizon_hours = st.select_slider("Forecast horizon", options=[12, 24, 36, 48, 72], value=24)
     
@@ -153,7 +165,6 @@ with st.sidebar:
 site_capacity = SITE_CONFIGS[site]["capacity_kw"]
 data = generate_site_data(site, days, 42)
 
-# Advanced historical window filtering
 with st.sidebar:
     st.divider()
     st.caption("Historical Filter View")
@@ -166,7 +177,7 @@ if isinstance(selected_range, tuple) and len(selected_range) == 2:
     mask = (data.timestamp.dt.date >= start_d) & (data.timestamp.dt.date <= end_d)
     filtered_data = data.loc[mask].copy()
     if filtered_data.empty:
-        filtered_data = data.copy() # fallback if range is too tight
+        filtered_data = data.copy()
 else:
     filtered_data = data.copy()
 
