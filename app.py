@@ -36,6 +36,14 @@ SITES = {
         "noise_scale": 7.2,
         "aqi_offset": 50,
     },
+    "Kolkata Sector V": {
+        "solar_capacity_kw": 100,
+        "base_load_kw": 100,
+        "load_shape": "office",
+        "aqi_soiling_factor": 0.08,
+        "noise_scale": 6.0,
+        "aqi_offset": 30,
+    },
 }
 
 
@@ -77,7 +85,8 @@ def fetch_live_aqi(city_name: str, token: str) -> tuple[float, str]:
     city_mapping = {
         "Pune Industrial Campus": "pune",
         "Bengaluru Tech Park": "bengaluru",
-        "Delhi Commercial Hub": "delhi"
+        "Delhi Commercial Hub": "delhi",
+        "Kolkata Sector V": "kolkata"
     }
     query_city = city_mapping.get(city_name, "kolkata")
     url = f"https://api.waqi.info/feed/{query_city}/?token={token}"
@@ -350,7 +359,6 @@ with st.sidebar:
 st.markdown(f"# {site}  ")
 st.caption(f"LIVE OPERATIONS VIEW  •  Source: {data_source_status}  •  Refreshed: {pd.Timestamp.now().strftime('%H:%M:%S')}")
 
-# Render status banner using the centralized alert checker
 render_status_banner(latest, forecast, solar_loss, night_status)
 
 cards = st.columns(4)
@@ -374,7 +382,6 @@ with left:
     fig.add_trace(go.Scatter(x=forecast.timestamp, y=forecast.upper, line=dict(width=0), showlegend=False, hoverinfo="skip"))
     fig.add_trace(go.Scatter(x=forecast.timestamp, y=forecast.lower, fill="tonexty", fillcolor="rgba(92, 183, 191, .16)", line=dict(width=0), name="95% confidence", hoverinfo="skip"))
     
-    # Dual-line scenario overlay
     fig.add_trace(go.Scatter(x=forecast.timestamp, y=forecast.forecast_baseline, name="Baseline (0°C)", line=dict(color="#a9c7ff", dash="dot", width=1.8)))
     fig.add_trace(go.Scatter(x=forecast.timestamp, y=forecast.forecast_scenario, name=f"Scenario ({weather_shift:+.1f}°C)", line=dict(color="#ffc857", dash="dash", width=2.5)))
     
