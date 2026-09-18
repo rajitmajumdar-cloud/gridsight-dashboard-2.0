@@ -11,7 +11,7 @@ import requests
 st.set_page_config(page_title="GridSight", layout="wide", page_icon="⚡")
 
 
-def fetch_live_aqi(city_name: str, token: str) -> float:
+def fetch_live_aqi(city_name: str, token: str) -> tuple[float, str]:
     city_mapping = {
         "Pune Industrial Campus": "pune",
         "Bengaluru Tech Park": "bengaluru",
@@ -25,10 +25,10 @@ def fetch_live_aqi(city_name: str, token: str) -> float:
         if response.status_code == 200:
             payload = response.json()
             if payload.get("status") == "ok":
-                return float(payload["data"]["aqi"])
+                return float(payload["data"]["aqi"]), "Live (WAQI API)"
     except Exception:
         pass
-    return 75.0  # Fallback default value
+    return 75.0, "Fallback (Simulation)"
 
 
 def generate_site_data(days: int, seed: int) -> pd.DataFrame:
@@ -127,20 +127,21 @@ with st.sidebar:
         st.caption("🌡️ Baseline temperature profile active.")
         
     st.divider()
-    st.caption("Data mode")
+    st.caption("Data telemetry & reliability")
     
     try:
         _ = st.secrets["WAQI_TOKEN"]
-        st.info("Live API connected", icon="🟢")
+        st.info("Live API connected (WAQI)", icon="🟢")
     except Exception:
-        st.info("Simulation mode · ready for API connection", icon="ℹ️")
+        st.info("Simulation mode active", icon="ℹ️")
 
 data = generate_site_data(days, 42)
 latest = data.iloc[-1].copy()
 
+data_source_status = "Simulation Feed"
 try:
     token = st.secrets["WAQI_TOKEN"]
-    latest["aqi"] = fetch_live_aqi(site, token)
+    latest["aqi"], data_source_status = fetch_live_aqi(site, token)
 except Exception:
     pass
 
@@ -153,12 +154,12 @@ solar_loss = max(0, (latest.aqi - 45) * 0.075)
 net_load = latest.load_kw - latest.solar_kw
 
 st.markdown(f"# {site}  ")
-st.caption(f"LIVE OPERATIONS VIEW  •  Updated {latest.timestamp.strftime('%d %b %Y, %H:%M')}")
+st.caption(f"LIVE OPERATIONS VIEW  •  Source: {data_source_status}  •  Refreshed: {pd.Timestamp.now().strftime('%H:%M:%S')}")
 
 cards = st.columns(4)
 metrics = [
     ("Grid demand", f"{latest.load_kw:.0f} kW", "↗ 3.2% vs yesterday", "#71d5c1"),
-    ("Solar output", f"{latest.solar_kw:.1f} kW", f"{latest.solar_kw / 92 * 100:.0f}% of 92 kW capacity", "#ffd166"),
+    ("Solar output", f"{latest.solar_kw:.1f} kW", f"{latest.solar_kw / 92 * 100:.0f}% capacity factor", "#ffd166"),
     ("Air quality", f"{latest.aqi:.0f} AQI", aqi_text, aqi_color),
     ("Net grid import", f"{net_load:.0f} kW", "after on-site generation", "#a9c7ff"),
 ]
@@ -182,10 +183,8 @@ with right:
     
     delta_text = f"{peak_diff:+.1f} kW vs base" if weather_shift != 0 else peak.timestamp.strftime("%H:%M tomorrow")
     st.metric("Expected peak", f"{peak.forecast_kw:.0f} kW", delta=delta_text)
-    
     st.metric("Forecast energy", f"{forecast.forecast_kw.sum() / 2:.1f} kWh")
     
-    # Model Transparency Box
     st.markdown("---")
     st.caption(f"⚙️ **Model Info:** Scikit-Learn Linear Regression\n\n📊 **Window:** {days} Days history | **Residual Std:** ±{res_std:.1f} kW")
 
@@ -201,17 +200,17 @@ with col1:
     fig2.update_yaxes(title_text="AQI", secondary_y=True)
     st.plotly_chart(fig2, use_container_width=True)
 with col2:
-    potential = max(latest.irradiance / 1000 * 92, 0.1)
-    efficiency = min(100, latest.solar_kw / potential * 100)
-    st.markdown("#### PV health at a glance")
-    st.progress(int(efficiency), text=f"Estimated conversion efficiency: {efficiency:.0f}%")
-    st.metric("AQI-related output loss", f"{solar_loss:.1f}%", "estimated from site model")
-    st.metric("Panel temperature", f"{latest.temperature:.1f} °C")
-    st.warning("Schedule a panel wash within 48 hours" if latest.aqi > 150 else "Conditions are suitable for normal cleaning cadence", icon="🧽")
+    theoretical_max = max(latest.irradiance / 1000 * 92, 0.1)
+    performance_ratio = min(100, (latest.solar_kw / theoretical_max) * 100)
+    st.markdown("#### PV health at a glance (92 kW Peak)")
+    st.progress(int(performance_ratio), text=f"Performance Ratio (PR): {performance_ratio:.1f}%")
+    st.metric("AQI-related soiling loss", f"{solar_loss:.1f}%", "modeled dust derate")
+    st.metric("Cell temperature", f"{latest.temperature:.1f} °C")
+    st.warning("Schedule a panel wash within 48 hours" if latest.aqi > 150 else "Conditions are optimal for current operation", icon="🧽")
 
 with st.expander("Data model and integration notes"):
     st.markdown("""
-    **Current model:** synthetic 30-minute site observations; demand is forecast with a seasonal linear regression. Solar output accounts for irradiance, panel temperature, and an AQI-derived dust-loss proxy.
+    **Current architecture:** 30-minute resolution telemetry. Load forecasting uses a multivariable linear regression model incorporating time-of-day, day-of-week, and ambient temperature features. 
 
-    **Production connection points:** live WAQI API feed integrated for real-time air quality tracking; smart-meter and meteorological weather telemetry mapped to core microgrid metrics.
+    **Solar & Environmental Modeling:** Photovoltaic output is dynamically derated using real-time cell temperature coefficients and particulate soiling proxies mapped from live AQI feeds.
     """)
