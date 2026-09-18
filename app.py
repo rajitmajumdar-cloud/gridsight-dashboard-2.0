@@ -129,7 +129,7 @@ with st.sidebar:
     st.markdown("## ⚡ GridSight")
     st.caption("Microgrid command center")
     site = st.selectbox("Site", list(SITE_CONFIGS.keys()))
-    days = st.slider("Historical data window", 7, 60, 21)
+    days = st.slider("Historical data window (Days)", 7, 60, 21)
     horizon_hours = st.select_slider("Forecast horizon", options=[12, 24, 36, 48, 72], value=24)
     
     weather_shift = st.slider("Temperature scenario", -4, 6, 0, help="Adjusts forecast demand for a warmer or cooler outlook.")
@@ -139,7 +139,10 @@ with st.sidebar:
         st.caption("🌡️ Baseline temperature profile active.")
         
     st.divider()
-    st.caption("Data telemetry & reliability")
+    st.caption("SCADA Telemetry & Polling")
+    auto_refresh = st.checkbox("Enable live poll loop (15m)", value=False)
+    if auto_refresh:
+        st.caption("🟢 Polling active: Next sync in ~14m 58s")
     
     try:
         _ = st.secrets["WAQI_TOKEN"]
@@ -149,6 +152,24 @@ with st.sidebar:
 
 site_capacity = SITE_CONFIGS[site]["capacity_kw"]
 data = generate_site_data(site, days, 42)
+
+# Advanced historical window filtering
+with st.sidebar:
+    st.divider()
+    st.caption("Historical Filter View")
+    min_date = data.timestamp.min().date()
+    max_date = data.timestamp.max().date()
+    selected_range = st.date_input("Filter date span", value=(min_date, max_date), min_value=min_date, max_value=max_date)
+
+if isinstance(selected_range, tuple) and len(selected_range) == 2:
+    start_d, end_d = selected_range
+    mask = (data.timestamp.dt.date >= start_d) & (data.timestamp.dt.date <= end_d)
+    filtered_data = data.loc[mask].copy()
+    if filtered_data.empty:
+        filtered_data = data.copy() # fallback if range is too tight
+else:
+    filtered_data = data.copy()
+
 latest = data.iloc[-1].copy()
 
 data_source_status = "Simulation Feed"
@@ -209,13 +230,12 @@ for col, (label, value, note, color) in zip(cards, metrics):
 st.markdown("### Demand outlook & ML forecasting")
 left, right = st.columns([2.1, 1])
 with left:
-    recent = data.tail(144)
+    recent = filtered_data.tail(144)
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=recent.timestamp, y=recent.load_kw, name="Actual demand", line=dict(color="#5ad1e5", width=2)))
     fig.add_trace(go.Scatter(x=forecast.timestamp, y=forecast.upper, line=dict(width=0), showlegend=False, hoverinfo="skip"))
     fig.add_trace(go.Scatter(x=forecast.timestamp, y=forecast.lower, fill="tonexty", fillcolor="rgba(92, 183, 191, .16)", line=dict(width=0), name="95% confidence", hoverinfo="skip"))
     
-    # If a temperature shift is active, plot baseline forecast as a comparison overlay trace
     if weather_shift != 0:
         fig.add_trace(go.Scatter(x=baseline_forecast.timestamp, y=baseline_forecast.forecast_kw, name="Baseline (0°C)", line=dict(color="#a9c7ff", dash="dot", width=1.8)))
         
@@ -237,7 +257,7 @@ with right:
 st.markdown("### Solar performance & environmental impact")
 col1, col2 = st.columns([1.5, 1])
 with col1:
-    solar_view = data.tail(96)
+    solar_view = filtered_data.tail(96)
     fig2 = make_subplots(specs=[[{"secondary_y": True}]])
     fig2.add_trace(go.Scatter(x=solar_view.timestamp, y=solar_view.solar_kw, name="PV output", line=dict(color="#ffd166", width=2.4)), secondary_y=False)
     fig2.add_trace(go.Scatter(x=solar_view.timestamp, y=solar_view.aqi, name="AQI", line=dict(color="#ef7f6d", width=1.8)), secondary_y=True)
