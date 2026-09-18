@@ -120,7 +120,6 @@ with st.sidebar:
     days = st.slider("Historical data window", 7, 60, 21)
     horizon_hours = st.select_slider("Forecast horizon", options=[12, 24, 36, 48, 72], value=24)
     
-    # Quantified temperature slider with dynamic caption feedback
     weather_shift = st.slider("Temperature scenario", -4, 6, 0, help="Adjusts forecast demand for a warmer or cooler outlook.")
     if weather_shift != 0:
         st.caption(f"🌡️ Thermal Scenario: {'+' if weather_shift > 0 else ''}{weather_shift}°C shift applied to baseline demand.")
@@ -145,7 +144,6 @@ try:
 except Exception:
     pass
 
-# Run forecasts for current scenario and a baseline 0-shift scenario to quantify impact
 forecast, res_std = forecast_load(data, horizon_hours * 2, weather_shift)
 baseline_forecast, _ = forecast_load(data, horizon_hours * 2, 0)
 peak_diff = forecast.forecast_kw.max() - baseline_forecast.forecast_kw.max()
@@ -181,7 +179,10 @@ with left:
 with right:
     peak = forecast.loc[forecast.forecast_kw.idxmax()]
     st.markdown("#### Forecast signal")
-    st.metric("Expected peak", f"{peak.forecast_kw:.0f} kW", peak.timestamp.strftime("%H:%M tomorrow"), delta=f"{peak_diff:+.1f} kW vs base" if weather_shift != 0 else None)
+    
+    delta_text = f"{peak_diff:+.1f} kW vs base" if weather_shift != 0 else peak.timestamp.strftime("%H:%M tomorrow")
+    st.metric("Expected peak", f"{peak.forecast_kw:.0f} kW", delta=delta_text)
+    
     st.metric("Forecast energy", f"{forecast.forecast_kw.sum() / 2:.1f} kWh")
     
     # Model Transparency Box
