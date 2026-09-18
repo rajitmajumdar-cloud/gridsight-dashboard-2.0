@@ -153,6 +153,19 @@ aqi_text, aqi_color = aqi_label(latest.aqi)
 solar_loss = max(0, (latest.aqi - 45) * 0.075)
 net_load = latest.load_kw - latest.solar_kw
 
+# Sidebar CSV Export Feature
+with st.sidebar:
+    st.divider()
+    st.caption("Report & Data Export")
+    csv_data = forecast.to_csv(index=False).encode('utf-8')
+    st.download_button(
+        label="📥 Download Forecast CSV",
+        data=csv_data,
+        file_name=f"gridsight_{site.lower().replace(' ', '_')}_forecast.csv",
+        mime="text/csv",
+        help="Export current machine learning demand forecast data."
+    )
+
 st.markdown(f"# {site}  ")
 st.caption(f"LIVE OPERATIONS VIEW  •  Source: {data_source_status}  •  Refreshed: {pd.Timestamp.now().strftime('%H:%M:%S')}")
 
