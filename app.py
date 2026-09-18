@@ -10,7 +10,7 @@ import requests
 
 st.set_page_config(page_title="GridSight", layout="wide", page_icon="⚡")
 
-# Site-specific configuration profiles (Eliminates hard-coded magic numbers)
+# Site-specific configuration profiles
 SITE_CONFIGS = {
     "Pune Industrial Campus": {"capacity_kw": 92.0, "base_load": 140.0, "aqi_offset": 10},
     "Bengaluru Tech Park": {"capacity_kw": 120.0, "base_load": 110.0, "aqi_offset": -20},
@@ -64,7 +64,6 @@ def generate_site_data(site_name: str, days: int, seed: int) -> pd.DataFrame:
     panel_derate = np.clip(1 - np.clip(temperature - 25, 0, None) * 0.004, 0.85, 1)
     dust_derate = np.clip(1 - np.clip(aqi - 45, 0, None) * 0.00075, 0.7, 1)
     
-    # Strict nighttime gating: zero out solar if irradiance drops below 10 W/m²
     solar_raw = (irradiance / 1000) * capacity * panel_derate * dust_derate
     solar_kw = np.where(irradiance < 10.0, 0.0, np.clip(solar_raw, 0, capacity))
 
@@ -148,7 +147,6 @@ with st.sidebar:
     except Exception:
         st.info("Simulation mode active", icon="ℹ️")
 
-# Fetch site profile capacity config
 site_capacity = SITE_CONFIGS[site]["capacity_kw"]
 data = generate_site_data(site, days, 42)
 latest = data.iloc[-1].copy()
@@ -182,6 +180,21 @@ with st.sidebar:
 
 st.markdown(f"# {site}  ")
 st.caption(f"LIVE OPERATIONS VIEW  •  Source: {data_source_status}  •  Refreshed: {pd.Timestamp.now().strftime('%H:%M:%S')}")
+
+# Operational Alert Strip Logic
+active_alerts = []
+if latest.aqi > 150:
+    active_alerts.append(("🔴 High Particulate Warning", f"Severe AQI levels ({latest.aqi:.0f}) detected. Active solar soiling derate applied."))
+if weather_shift != 0:
+    active_alerts.append(("🌡️ Thermal Scenario Active", f"{weather_shift:+.1f}°C temperature shift applied to predictive load models."))
+if latest.load_kw > (SITE_CONFIGS[site]["base_load"] * 1.1):
+    active_alerts.append(("⚡ High Demand Event", f"Current grid load ({latest.load_kw:.0f} kW) is elevated above baseline profile."))
+
+if active_alerts:
+    for title, msg in active_alerts:
+        st.warning(f"**{title}:** {msg}")
+else:
+    st.success("🟢 **System Status Normal:** All microgrid telemetry parameters operating within optimal parameters.", icon="✅")
 
 cards = st.columns(4)
 current_capacity_factor = (latest.solar_kw / site_capacity) * 100
