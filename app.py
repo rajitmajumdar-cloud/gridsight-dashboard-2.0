@@ -76,6 +76,12 @@ SITES = {
 # process, so it must not be used to seed reproducible synthetic data).
 SITE_SEED_OFFSETS = {name: i * 137 for i, name in enumerate(SITES)}
 
+# Time-of-use assumption for the recommendation engine: commercial tariffs
+# typically carry a demand-charge premium during evening peak hours.
+PEAK_HOUR_START = 17.0
+PEAK_HOUR_END = 22.0
+PEAK_TARIFF_MULTIPLIER = 2.0
+
 # ============================================================
 # SECRETS
 # ============================================================
@@ -108,6 +114,16 @@ def get_db_connection():
             PRIMARY KEY (timestamp, site)
         )
     """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS decisions_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            site TEXT,
+            shift_kw REAL,
+            savings_inr REAL,
+            co2_avoided_kg REAL
+        )
+    """)
     conn.commit()
     return conn
 
@@ -120,6 +136,14 @@ def persist_telemetry(df: pd.DataFrame, site_name: str):
             INSERT OR IGNORE INTO telemetry_log (timestamp, site, load_kw, solar_kw, temperature, aqi)
             VALUES (?, ?, ?, ?, ?, ?)
         """, (str(row["timestamp"]), site_name, row["load_kw"], row["solar_kw"], row["temperature"], row["aqi"]))
+    db_conn.commit()
+
+def log_decision(site_name: str, shift_kw: float, savings_inr: float, co2_avoided_kg: float):
+    cursor = db_conn.cursor()
+    cursor.execute("""
+        INSERT INTO decisions_log (timestamp, site, shift_kw, savings_inr, co2_avoided_kg)
+        VALUES (?, ?, ?, ?, ?)
+    """, (datetime.now().isoformat(), site_name, shift_kw, savings_inr, co2_avoided_kg))
     db_conn.commit()
 
 # ============================================================
@@ -394,6 +418,55 @@ def aqi_label(value: float) -> tuple[str, str]:
 def is_night_mode(irradiance: float, hour: float) -> bool:
     return irradiance < 45 or hour < 5.8 or hour > 18.8
 
+# ============================================================
+# RECOMMENDATION ENGINE
+# Rule-based (not ML): looks for meaningfully elevated demand specifically
+# inside the evening peak-tariff window (independent of where the forecast's
+# single global maximum happens to fall — a Ridge/Fourier fit can place that
+# anywhere in the horizon) and, if found, suggests moving a fixed EV-charging
+# block to the cheapest off-peak hour, quantified via the TOU assumption above.
+# ============================================================
+def generate_recommendation(forecast: pd.DataFrame, cfg: dict, current_ev_shift_kw: float) -> dict | None:
+    if current_ev_shift_kw > 0:
+        return None  # a shift is already applied — don't suggest stacking another
+
+    peak_window = forecast[(forecast.timestamp.dt.hour >= PEAK_HOUR_START) & (forecast.timestamp.dt.hour <= PEAK_HOUR_END)]
+    off_peak = forecast[(forecast.timestamp.dt.hour < PEAK_HOUR_START) | (forecast.timestamp.dt.hour > PEAK_HOUR_END)]
+    if peak_window.empty or off_peak.empty:
+        return None
+
+    from_row = peak_window.loc[peak_window.forecast_scenario_dr.idxmax()]
+    to_row = off_peak.loc[off_peak.forecast_scenario_dr.idxmin()]
+
+    # Only worth recommending if the peak-window demand is meaningfully above
+    # what's achievable off-peak — otherwise there's nothing worth shifting.
+    if from_row.forecast_scenario_dr < to_row.forecast_scenario_dr + 10:
+        return None
+
+    suggested_shift_kw = 30.0  # a typical EV fleet charging block; capped well under the 50kW slider max
+    hours_shifted = PEAK_HOUR_END - PEAK_HOUR_START
+    peak_premium_per_kwh = cfg["tariff_inr"] * (PEAK_TARIFF_MULTIPLIER - 1)
+    savings_inr = suggested_shift_kw * peak_premium_per_kwh * hours_shifted
+    # CO2 estimate assumes off-peak grid draw is modestly cleaner than peak
+    # (peaker plants skew the peak-hour mix) — a rough, clearly-labeled proxy.
+    co2_avoided_kg = suggested_shift_kw * hours_shifted * cfg["grid_emission_factor_kg_kwh"] * 0.10
+
+    return {
+        "shift_kw": suggested_shift_kw,
+        "from_hour": from_row.timestamp.strftime("%H:%M"),
+        "to_hour": to_row.timestamp.strftime("%H:%M"),
+        "savings_inr": savings_inr,
+        "co2_avoided_kg": co2_avoided_kg,
+    }
+
+def apply_recommendation(site_name: str, shift_kw: float, savings_inr: float, co2_avoided_kg: float):
+    # Runs as an on_click callback (before the script reruns from the top),
+    # so the slider's session_state can be updated safely here — doing this
+    # inline after the widget has already rendered in the same run raises
+    # StreamlitWidgetAlreadyInstantiatedError.
+    st.session_state["ev_shift_kw_slider"] = int(shift_kw)
+    log_decision(site_name, shift_kw, savings_inr, co2_avoided_kg)
+
 def render_status_banner(latest, forecast, night: bool, outage: bool, autonomy_hours: float):
     messages = []
     if outage:
@@ -453,7 +526,7 @@ with st.sidebar:
         st.divider()
         st.markdown("**🛡️ Resilience & Demand Response**")
         simulate_outage = st.checkbox("🚨 Simulate Grid Blackout (Island Mode)", value=False)
-        ev_shift_kw = st.slider("⚡ EV Fleet Load Shifting (kW)", 0, 50, 0, step=5)
+        ev_shift_kw = st.slider("⚡ EV Fleet Load Shifting (kW)", 0, 50, 0, step=5, key="ev_shift_kw_slider")
     else:
         site = "Pune Industrial Campus"
         cfg = SITES[site]
@@ -640,6 +713,24 @@ else:
 
     render_status_banner(latest, forecast, night, simulate_outage, autonomy_hours)
 
+    recommendation = None if simulate_outage else generate_recommendation(forecast, cfg, ev_shift_kw)
+    if recommendation:
+        rec_col1, rec_col2 = st.columns([3.2, 1])
+        with rec_col1:
+            st.info(
+                f"🤖 **Recommendation:** Shift **{recommendation['shift_kw']:.0f} kW** of EV charging from "
+                f"**{recommendation['from_hour']}** to **{recommendation['to_hour']}** → save "
+                f"**₹{recommendation['savings_inr']:,.0f}** and avoid **{recommendation['co2_avoided_kg']:.1f} kg CO₂** today.",
+                icon="🤖",
+            )
+        with rec_col2:
+            st.write("")
+            st.button(
+                "✅ Apply", use_container_width=True, key="apply_recommendation",
+                on_click=apply_recommendation,
+                args=(site, recommendation["shift_kw"], recommendation["savings_inr"], recommendation["co2_avoided_kg"]),
+            )
+
     cards = st.columns(5)
     metrics = [
         ("Grid demand", f"{adjusted_load_kw:.0f} kW", f"DR Shift: -{ev_shift_kw} kW active" if ev_shift_kw > 0 else f"Tariff: ₹{cfg['tariff_inr']}/kWh", "#71d5c1"),
@@ -781,6 +872,23 @@ else:
 
         status_badge = "🟢 Islandable (Secure)" if autonomy_hours >= 4.0 else "🔴 At Risk (Shed Load)"
         st.caption(f"Status: **{status_badge}** • Storage Capacity: {cfg['battery_capacity_kwh']} kWh")
+
+    st.markdown("### 📅 This Month, You Saved")
+    month_cursor = db_conn.cursor()
+    current_month = datetime.now().strftime("%Y-%m")
+    month_cursor.execute("""
+        SELECT COALESCE(SUM(savings_inr), 0), COALESCE(SUM(co2_avoided_kg), 0),
+               COALESCE(SUM(shift_kw), 0), COUNT(*)
+        FROM decisions_log
+        WHERE site = ? AND strftime('%Y-%m', timestamp) = ?
+    """, (site, current_month))
+    month_savings, month_co2, month_shift_kw, month_count = month_cursor.fetchone()
+
+    mc1, mc2, mc3 = st.columns(3)
+    mc1.metric("💰 Total Saved", f"₹{month_savings:,.0f}", f"{month_count} recommendation(s) applied")
+    mc2.metric("🌱 CO₂ Avoided", f"{month_co2:.1f} kg", "from load-shifting decisions")
+    mc3.metric("⚡ Peak Demand Reduced", f"{month_shift_kw:.0f} kW", "cumulative across decisions")
+    st.caption("Tracked since this app instance started — resets on redeploy, same as the SQLite telemetry log above.")
 
     csv = forecast[["timestamp", "forecast_baseline", "forecast_scenario", "forecast_scenario_dr", "lower", "upper"]].to_csv(index=False)
     st.sidebar.download_button(
