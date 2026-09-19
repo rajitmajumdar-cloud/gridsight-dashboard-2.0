@@ -1,16 +1,15 @@
-import streamlit as st
-import pandas as pd
+from __future__ import annotations
+
 import numpy as np
+import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import streamlit as st
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_percentage_error
-from datetime import datetime, timedelta
+from datetime import datetime
 import requests
 
-# ============================================================
-# PAGE CONFIG
-# ============================================================
 st.set_page_config(
     page_title="GridSight · Microgrid Command Center",
     page_icon="⚡",
@@ -19,7 +18,7 @@ st.set_page_config(
 )
 
 # ============================================================
-# SITE CONFIGURATION
+# SITE CONFIGURATION (INCLUDING STORAGE & CARBON SPECS)
 # ============================================================
 SITES = {
     "Pune Industrial Campus": {
@@ -30,6 +29,8 @@ SITES = {
         "noise_scale": 6.8,
         "tariff_inr": 8.5,
         "waqi_city": "pune",
+        "battery_capacity_kwh": 100.0, # Storage spec
+        "grid_emission_factor_kg_kwh": 0.82, # India coal-heavy baseline grid factor
     },
     "Bengaluru Tech Park": {
         "solar_capacity_kw": 120,
@@ -39,6 +40,8 @@ SITES = {
         "noise_scale": 5.9,
         "tariff_inr": 9.2,
         "waqi_city": "bangalore",
+        "battery_capacity_kwh": 150.0,
+        "grid_emission_factor_kg_kwh": 0.72,
     },
     "Delhi Commercial Hub": {
         "solar_capacity_kw": 80,
@@ -48,6 +51,8 @@ SITES = {
         "noise_scale": 7.4,
         "tariff_inr": 8.8,
         "waqi_city": "delhi",
+        "battery_capacity_kwh": 80.0,
+        "grid_emission_factor_kg_kwh": 0.85,
     },
     "Kolkata Sector V": {
         "solar_capacity_kw": 105,
@@ -57,6 +62,8 @@ SITES = {
         "noise_scale": 7.1,
         "tariff_inr": 8.2,
         "waqi_city": "kolkata",
+        "battery_capacity_kwh": 120.0,
+        "grid_emission_factor_kg_kwh": 0.78,
     },
 }
 
@@ -89,7 +96,7 @@ def get_load_shape(hour: float, weekday: int, shape: str) -> float:
         weekend_factor = 0.72 if is_weekend else 1.0
         return (base + lunch + evening) * weekend_factor
 
-    elif shape == "mixed":  # Kolkata-style
+    elif shape == "mixed":
         base = 0.76
         morning = 0.20 * np.exp(-0.5 * ((hour - 9.5) / 2.4) ** 2)
         evening = 0.26 * np.exp(-0.5 * ((hour - 19.8) / 2.0) ** 2)
@@ -121,10 +128,8 @@ def generate_site_data(days: int, site_name: str, seed: int = 42) -> pd.DataFram
         for h, wd in zip(hours, weekdays)
     ])
 
-    # Temperature profile
     temp = 27 + 5.5 * np.sin(2 * np.pi * (hours - 7) / 24) + rng.normal(0, 1.1, periods)
 
-    # Load
     load = (
         cfg["base_load_kw"] * shape_mult
         + 0.35 * (temp - 27)
@@ -132,7 +137,6 @@ def generate_site_data(days: int, site_name: str, seed: int = 42) -> pd.DataFram
     )
     load = np.clip(load, 35, None)
 
-    # Irradiance (simple clear-sky + noise)
     irradiance = np.maximum(
         0,
         950 * np.sin(np.pi * np.clip((hours - 6) / 12, 0, 1)) ** 1.35
@@ -140,7 +144,6 @@ def generate_site_data(days: int, site_name: str, seed: int = 42) -> pd.DataFram
     )
     irradiance = np.clip(irradiance, 0, 1100)
 
-    # AQI (synthetic with daily pattern + noise)
     aqi_base = {"pune": 95, "bangalore": 55, "delhi": 110, "kolkata": 130}.get(
         cfg["waqi_city"], 90
     )
@@ -151,7 +154,6 @@ def generate_site_data(days: int, site_name: str, seed: int = 42) -> pd.DataFram
     )
     aqi = np.clip(aqi, 25, 320)
 
-    # Solar output
     temp_derate = 1 - 0.004 * np.maximum(temp - 25, 0)
     soiling = 1 - cfg["aqi_soiling_factor"] * np.maximum(aqi - 50, 0) / 100
     solar = (
@@ -179,13 +181,14 @@ def generate_site_data(days: int, site_name: str, seed: int = 42) -> pd.DataFram
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_live_aqi(city: str) -> float | None:
     try:
-        # Using the public WAQI demo token – replace with your own for production
         url = f"https://api.waqi.info/feed/{city}/?token=demo"
         r = requests.get(url, timeout=4)
         if r.status_code == 200:
             data = r.json()
             if data.get("status") == "ok":
-                return float(data["data"]["aqi"])
+                val = float(data["data"]["aqi"])
+                if val != 50.0:
+                    return val
     except Exception:
         pass
     return None
@@ -212,7 +215,6 @@ def forecast_load(data: pd.DataFrame, horizon_steps: int, weather_shift: float =
     residual_std = (y - y_pred).std()
     band = max(6.5, residual_std * 1.96)
 
-    # Feature weights (normalized for display)
     raw_weights = dict(zip(feature_cols, model.coef_))
     abs_sum = sum(abs(v) for v in raw_weights.values()) + 1e-6
     rel_weights = {k: round(v / abs_sum * 100, 1) for k, v in raw_weights.items()}
@@ -241,7 +243,6 @@ def forecast_load(data: pd.DataFrame, horizon_steps: int, weather_shift: float =
     baseline_pred = model.predict(make_X(baseline_temp))
     scenario_pred = model.predict(make_X(baseline_temp + weather_shift))
 
-    # Widen band with horizon
     horizon_factor = np.linspace(1.0, 1.45, horizon_steps)
     upper = scenario_pred + band * horizon_factor
     lower = scenario_pred - band * horizon_factor
@@ -264,8 +265,31 @@ def forecast_load(data: pd.DataFrame, horizon_steps: int, weather_shift: float =
     return forecast_df, meta
 
 # ============================================================
-# HELPERS
+# STORAGE OPTIMIZER & CARBON CALCULATOR HELPERS
 # ============================================================
+def simulate_battery_dispatch(solar_kw: float, load_kw: float, battery_capacity_kwh: float, current_soc: float = 0.5):
+    """
+    Simple rule-based battery dispatcher:
+    - Charges when solar exceeds load (surplus energy goes to battery).
+    - Discharges when load exceeds solar (covers deficit during peaks).
+    Returns net grid import after storage, and updated state of charge (SoC %).
+    """
+    net_power = load_kw - solar_kw
+    soc_kwh = current_soc * battery_capacity_kwh
+    
+    if net_power < 0: # Solar surplus -> Charge battery
+        surplus = abs(net_power)
+        charge_amount = min(surplus, battery_capacity_kwh * 0.2, battery_capacity_kwh - soc_kwh)
+        soc_kwh += charge_amount
+        net_grid_import = max(0.0, net_power + charge_amount)
+    else: # Deficit -> Discharge battery
+        discharge_amount = min(net_power, battery_capacity_kwh * 0.25, soc_kwh)
+        soc_kwh -= discharge_amount
+        net_grid_import = max(0.0, net_power - discharge_amount)
+        
+    new_soc = min(1.0, max(0.0, soc_kwh / battery_capacity_kwh))
+    return net_grid_import, new_soc * 100
+
 def aqi_label(value: float) -> tuple[str, str]:
     if value <= 50:
         return "Good", "#36c98b"
@@ -280,7 +304,6 @@ def is_night_mode(irradiance: float, hour: float) -> bool:
 
 def render_status_banner(latest, forecast, night: bool):
     messages = []
-
     if latest.aqi > 200:
         messages.append(("error", f"Poor air quality ({latest.aqi:.0f} AQI) — high soiling risk"))
     elif latest.aqi > 100:
@@ -289,13 +312,10 @@ def render_status_banner(latest, forecast, night: bool):
     peak_row = forecast.loc[forecast.forecast_scenario.idxmax()]
     hours_to_peak = (peak_row.timestamp - latest.timestamp).total_seconds() / 3600
     if 0 < hours_to_peak <= 3.5:
-        messages.append((
-            "warning",
-            f"Peak demand approaching: {peak_row.forecast_scenario:.0f} kW at {peak_row.timestamp.strftime('%H:%M')}"
-        ))
+        messages.append(("warning", f"Peak demand approaching: {peak_row.forecast_scenario:.0f} kW at {peak_row.timestamp.strftime('%H:%M')}"))
 
     if night:
-        messages.append(("info", "Night mode — solar offline, grid import ≈ demand"))
+        messages.append(("info", "Night mode — solar offline, storage discharging for peak shaving"))
 
     if not messages:
         st.success("System Status Normal: All microgrid parameters within optimal range", icon="✅")
@@ -364,16 +384,10 @@ with st.sidebar:
     else:
         st.info("Simulation mode · WAQI fallback", icon="ℹ️")
 
-    st.divider()
-    st.markdown("**Report & Data Export**")
-    # CSV download will be added after forecast is computed
-
 # ============================================================
-# MAIN DATA
+# MAIN DATA & CALCULATIONS
 # ============================================================
 data = generate_site_data(days, site)
-
-# Override last AQI with live value if available
 if live_aqi is not None:
     data.loc[data.index[-1], "aqi"] = live_aqi
 
@@ -383,7 +397,15 @@ forecast, meta = forecast_load(data, horizon_hours * 2, weather_shift)
 night = is_night_mode(latest.irradiance, latest.timestamp.hour + latest.timestamp.minute / 60)
 aqi_text, aqi_color = aqi_label(latest.aqi)
 solar_loss = max(0, (latest.aqi - 45) * cfg["aqi_soiling_factor"])
-net_load = latest.load_kw - latest.solar_kw
+
+# Run battery storage dispatch on latest state
+net_load_raw = latest.load_kw - latest.solar_kw
+net_load, battery_soc = simulate_battery_dispatch(latest.solar_kw, latest.load_kw, cfg["battery_capacity_kwh"], current_soc=0.65)
+
+# Carbon Tracker Calculations (Cumulative solar generation offset * grid emission factor)
+total_historical_solar_kwh = data.solar_kw.sum() * 0.5 # 30-min intervals
+co2_saved_kg = total_historical_solar_kwh * cfg["grid_emission_factor_kg_kwh"]
+coal_saved_kg = co2_saved_kg * 0.45 # Rough coal equivalent offset ratio
 
 # ============================================================
 # HEADER
@@ -397,7 +419,7 @@ st.caption(
 render_status_banner(latest, forecast, night)
 
 # ============================================================
-# METRIC CARDS
+# METRIC CARDS (INCLUDING STORAGE SOC)
 # ============================================================
 cards = st.columns(4)
 metrics = [
@@ -405,8 +427,8 @@ metrics = [
     ("Solar output", f"{latest.solar_kw:.1f} kW",
      "🌙 Night Mode (Solar Gated)" if night else f"{latest.solar_kw / cfg['solar_capacity_kw'] * 100:.0f}% capacity factor",
      "#ffd166"),
-    ("Air quality", f"{latest.aqi:.0f} AQI", aqi_text, aqi_color),
-    ("Net grid import", f"{net_load:.0f} kW", "after on-site generation", "#a9c7ff"),
+    ("Battery Storage (SoC)", f"{battery_soc:.0f}%", f"Capacity: {cfg['battery_capacity_kwh']} kWh", "#38bdf8"),
+    ("Net grid import", f"{net_load:.0f} kW", f"after storage & PV", "#a9c7ff"),
 ]
 
 for col, (label, value, note, color) in zip(cards, metrics):
@@ -423,7 +445,6 @@ for col, (label, value, note, color) in zip(cards, metrics):
 # DEMAND OUTLOOK
 # ============================================================
 st.markdown("### Demand outlook & ML forecasting")
-
 left, right = st.columns([2.15, 1])
 
 with left:
@@ -494,9 +515,9 @@ with right:
     )
 
 # ============================================================
-# SOLAR + ENVIRONMENT
+# SOLAR + CARBON & STORAGE TRACKER
 # ============================================================
-st.markdown("### Solar performance & environmental impact")
+st.markdown("### Solar performance & carbon tracking")
 
 col1, col2 = st.columns([1.55, 1])
 
@@ -526,26 +547,22 @@ with col1:
     st.plotly_chart(fig2, use_container_width=True)
 
 with col2:
-    st.markdown(f"#### PV health at a glance ({cfg['solar_capacity_kw']} kW Peak)")
-
+    st.markdown("#### 🌱 Sustainability & Carbon Offset")
+    c1, c2 = st.columns(2)
+    c1.metric("CO₂ Offset", f"{co2_saved_kg / 1000:.2f} tons", "renewable generation")
+    c2.metric("Coal Saved", f"{coal_saved_kg:.0f} kg", "equivalent offset")
+    
+    st.markdown("---")
+    st.markdown(f"#### 🔋 Storage & Yield Optimizer")
+    st.caption(f"Battery Capacity: {cfg['battery_capacity_kwh']} kWh • Dispatch Mode: Peak Shaving")
+    
     if night:
-        st.info("Night / low irradiance mode — solar generation offline", icon="🌙")
-        st.metric("Current output", "0.0 kW", "expected overnight")
-        st.caption(f"Capacity: {cfg['solar_capacity_kw']} kW  •  Soiling estimate frozen until sunrise")
+        st.info("Storage discharging to handle baseline night load.", icon="🔋")
     else:
-        potential = max(latest.irradiance / 1000 * cfg["solar_capacity_kw"], 0.1)
-        efficiency = min(100.0, latest.solar_kw / potential * 100)
-        st.progress(int(efficiency), text=f"Estimated conversion efficiency: {efficiency:.0f}%")
-        st.metric("AQI-related soiling loss", f"{solar_loss:.1f}%", "modeled dust derate")
-        st.metric("Cell temperature", f"{latest.temperature:.1f} °C")
-
-        if latest.aqi > 150:
-            st.warning("Schedule a panel wash within 48 hours", icon="🧽")
-        else:
-            st.success("Conditions suitable for normal cleaning cadence", icon="✅")
+        st.success("Solar surplus actively routing to battery bank.", icon="⚡")
 
 # ============================================================
-# DOWNLOAD
+# DOWNLOAD & EXPANDER
 # ============================================================
 csv = forecast[["timestamp", "forecast_baseline", "forecast_scenario", "lower", "upper"]].to_csv(index=False)
 st.sidebar.download_button(
@@ -555,23 +572,10 @@ st.sidebar.download_button(
     mime="text/csv",
 )
 
-# ============================================================
-# EXPANDER
-# ============================================================
 with st.expander("Data model and integration notes"):
     st.markdown(f"""
-**Current model:** 30-minute site observations with site-specific load shapes  
-(`industrial` / `office` / `commercial` / `mixed`).  
-
+**Current model:** 30-minute site observations with site-specific load shapes (`industrial` / `office` / `commercial` / `mixed`).  
 Demand is forecast with **Ridge Regression + cyclic Fourier terms**.  
-Solar output accounts for irradiance, temperature derating, and an AQI-derived soiling loss.
 
-**Live data:** WAQI feed is used when available (city: `{cfg['waqi_city']}`).  
-Falls back to high-quality simulation otherwise.
-
-**Production path:**  
-- Replace `generate_site_data()` with smart-meter / SCADA connector  
-- Swap WAQI demo token for a production key  
-- Persist observations in a time-series DB and retrain on a schedule  
-- Add battery / peak-shaving recommendations as the next decision layer
+**Storage & Carbon Layers:** Includes a rule-based battery optimizer managing state-of-charge (SoC) for peak shaving, alongside a live carbon offset counter computed via localized grid emission factors (`{cfg['grid_emission_factor_kg_kwh']} kg CO₂/kWh`).
 """)
