@@ -212,7 +212,7 @@ def fetch_live_aqi(city: str, site_name: str) -> tuple[float, bool]:
     return fallbacks.get(site_name, 90.0), False
 
 # ============================================================
-# FORECAST ENGINE (WITH ENHANCED TEMPERATURE SENSITIVITY)
+# FORECAST ENGINE
 # ============================================================
 def forecast_load(data: pd.DataFrame, horizon_steps: int, weather_shift: float = 0.0):
     df = data.copy()
@@ -225,7 +225,7 @@ def forecast_load(data: pd.DataFrame, horizon_steps: int, weather_shift: float =
     X = df[feature_cols]
     y = df["load_kw"]
 
-    model = Ridge(alpha=0.6)  # Lower alpha to give temperature feature more weight
+    model = Ridge(alpha=0.6)
     model.fit(X, y)
 
     y_pred = model.predict(X)
@@ -259,7 +259,6 @@ def forecast_load(data: pd.DataFrame, horizon_steps: int, weather_shift: float =
         })
 
     baseline_pred = model.predict(make_X(baseline_temp))
-    # Amplified temperature sensitivity coefficient for realistic HVAC response
     scenario_pred = model.predict(make_X(baseline_temp + weather_shift)) + (weather_shift * 3.5)
 
     horizon_factor = np.linspace(1.0, 1.45, horizon_steps)
@@ -381,25 +380,30 @@ with st.sidebar:
     st.markdown("## ⚡ GridSight")
     st.caption("Microgrid command center")
 
-    site = st.selectbox("Site", list(SITES.keys()))
-    cfg = SITES[site]
-
-    days = st.slider("Historical data window (Days)", 7, 60, 21)
-    horizon_hours = st.select_slider("Forecast horizon", options=[12, 24, 36, 48, 72], value=24)
-    weather_shift = st.slider(
-        "Temperature scenario (°C)", -4, 8, 0,
-        help="Simulates heatwaves or cold snaps on HVAC demand."
-    )
-
+    view_mode = st.radio("Command Mode", ["Single-Site Operations", "🌐 Portfolio Executive Overview"])
     st.divider()
-    st.markdown("**🛡️ Resilience & Demand Response**")
-    simulate_outage = st.checkbox("🚨 Simulate Grid Blackout (Island Mode)", value=False)
-    ev_shift_kw = st.slider("⚡ EV Fleet Load Shifting (kW)", 0, 50, 0, step=5, help="Shifts flexible EV charging away from peak hours.")
+
+    if view_mode == "Single-Site Operations":
+        site = st.selectbox("Site", list(SITES.keys()))
+        cfg = SITES[site]
+
+        days = st.slider("Historical data window (Days)", 7, 60, 21)
+        horizon_hours = st.select_slider("Forecast horizon", options=[12, 24, 36, 48, 72], value=24)
+        weather_shift = st.slider("Temperature scenario (°C)", -4, 8, 0)
+
+        st.divider()
+        st.markdown("**🛡️ Resilience & Demand Response**")
+        simulate_outage = st.checkbox("🚨 Simulate Grid Blackout (Island Mode)", value=False)
+        ev_shift_kw = st.slider("⚡ EV Fleet Load Shifting (kW)", 0, 50, 0, step=5)
+    else:
+        site = "Pune Industrial Campus"  # Default fallback
+        cfg = SITES[site]
+        simulate_outage = False
+        ev_shift_kw = 0
+        weather_shift = 0
 
     st.divider()
     st.markdown("**SCADA Telemetry & Polling**")
-    live_poll = st.checkbox("Enable live poll loop (15m)", value=False)
-
     live_aqi_val, is_true_live = fetch_live_aqi(cfg["waqi_city"], site)
     if is_true_live:
         st.success(f"Live API connected (WAQI: {int(live_aqi_val)})", icon="🟢")
@@ -407,228 +411,252 @@ with st.sidebar:
         st.info("Simulation mode · Site profile active", icon="ℹ️")
 
 # ============================================================
-# MAIN DATA & CALCULATIONS
+# PORTFOLIO EXECUTIVE OVERVIEW MODE
 # ============================================================
-data = generate_site_data(days, site)
-data.loc[data.index[-1], "aqi"] = live_aqi_val
+if view_mode == "🌐 Portfolio Executive Overview":
+    st.markdown("# 🌐 Portfolio Executive Command")
+    st.caption(f"PORTFOLIO-WIDE MULTI-SITE TELEMETRY • Active Campuses: {len(SITES)} • Refreshed: {datetime.now().strftime('%H:%M:%S')}")
+    st.markdown("---")
 
-latest = data.iloc[-1]
-forecast, meta = forecast_load(data, horizon_hours * 2, weather_shift)
+    portfolio_rows = []
+    total_portfolio_solar = 0.0
+    total_portfolio_load = 0.0
+    total_portfolio_co2 = 0.0
 
-# Apply Active Demand Response to Forecast Curve
-forecast["forecast_scenario_dr"] = np.maximum(35.0, forecast["forecast_scenario"] - ev_shift_kw)
+    for s_name, s_cfg in SITES.items():
+        s_data = generate_site_data(14, s_name)
+        s_aqi, _ = fetch_live_aqi(s_cfg["waqi_city"], s_name)
+        s_latest = s_data.iloc[-1]
+        s_co2 = (s_data.solar_kw.sum() * 0.5) * s_cfg["grid_emission_factor_kg_kwh"] / 1000
+        
+        total_portfolio_solar += s_latest.solar_kw
+        total_portfolio_load += s_latest.load_kw
+        total_portfolio_co2 += s_co2
 
-night = is_night_mode(latest.irradiance, latest.timestamp.hour + latest.timestamp.minute / 60)
-aqi_text, aqi_color = aqi_label(latest.aqi)
-solar_loss = max(0, (latest.aqi - 45) * cfg["aqi_soiling_factor"])
+        portfolio_rows.append({
+            "Campus Site": s_name,
+            "Solar Cap (kW)": s_cfg["solar_capacity_kw"],
+            "Live Solar (kW)": round(s_latest.solar_kw, 1),
+            "Live Load (kW)": round(s_latest.load_kw, 1),
+            "Live AQI": round(s_aqi, 0),
+            "Battery (kWh)": s_cfg["battery_capacity_kwh"],
+            "CO₂ Offset (Tons)": round(s_co2, 2),
+            "Tariff (₹/kWh)": s_cfg["tariff_inr"]
+        })
 
-# Apply Demand Response to Current Load
-adjusted_load_kw = max(35.0, latest.load_kw - ev_shift_kw)
+    port_df = pd.DataFrame(portfolio_rows)
 
-# Island Mode Autonomy & Resilience Calculations
-current_battery_kwh = 0.65 * cfg["battery_capacity_kwh"]
-net_critical_load = max(10.0, adjusted_load_kw - latest.solar_kw)
-autonomy_hours = current_battery_kwh / net_critical_load if net_critical_load > 0 else 24.0
-critical_load_coverage_pct = min(100.0, (latest.solar_kw + (cfg["battery_capacity_kwh"] * 0.25)) / adjusted_load_kw * 100)
+    p1, p2, p3 = st.columns(3)
+    p1.metric("Total Portfolio Solar Output", f"{total_portfolio_solar:.1f} kW", f"across {len(SITES)} campuses")
+    p2.metric("Total Portfolio Load Demand", f"{total_portfolio_load:.1f} kW", "live aggregate")
+    p3.metric("Combined CO₂ Offsets", f"{total_portfolio_co2:.2f} tons", "lifetime renewable impact")
 
-if simulate_outage:
-    net_load = 0.0
-    battery_soc = max(5.0, 65.0 - (1.5 / autonomy_hours * 30))
-    grid_status_text = f"🚨 Island Mode ({autonomy_hours:.1f}h reserve)"
-    grid_color = "#ef7f6d" if autonomy_hours < 4.0 else "#ffd166"
-else:
-    net_load, battery_soc = simulate_battery_dispatch(latest.solar_kw, adjusted_load_kw, cfg["battery_capacity_kwh"], current_soc=0.65)
-    grid_status_text = "after storage & PV"
-    grid_color = "#a9c7ff"
+    st.markdown("### Campus Performance Matrix")
+    st.dataframe(port_df, use_container_width=True, hide_index=True)
 
-# Carbon Tracker Calculations (Including current intensity & next 24h forecast)
-total_historical_solar_kwh = data.solar_kw.sum() * 0.5
-co2_saved_kg = total_historical_solar_kwh * cfg["grid_emission_factor_kg_kwh"]
-coal_saved_kg = co2_saved_kg * 0.45
-current_carbon_intensity = cfg["grid_emission_factor_kg_kwh"] * 1000 # g CO2/kWh
-next_24h_solar_kwh = forecast.head(48).forecast_scenario.sum() * 0.25 # rough estimate
-next_24h_co2_offset_kg = next_24h_solar_kwh * cfg["grid_emission_factor_kg_kwh"]
-
-# ============================================================
-# HEADER
-# ============================================================
-st.markdown(f"# {site}")
-st.caption(
-    f"LIVE OPERATIONS VIEW  •  Source: {'Live (WAQI API)' if is_true_live else 'Simulation Profile'}  •  "
-    f"Refreshed: {datetime.now().strftime('%H:%M:%S')}"
-)
-
-render_status_banner(latest, forecast, night, simulate_outage, autonomy_hours)
-
-# ============================================================
-# METRIC CARDS (5-COLUMN LAYOUT)
-# ============================================================
-cards = st.columns(5)
-metrics = [
-    ("Grid demand", f"{adjusted_load_kw:.0f} kW", f"DR Shift: -{ev_shift_kw} kW active" if ev_shift_kw > 0 else "↗ 3.2% vs yesterday", "#71d5c1"),
-    ("Solar output", f"{latest.solar_kw:.1f} kW",
-     "🌙 Night Mode (Gated)" if night else f"{latest.solar_kw / cfg['solar_capacity_kw'] * 100:.0f}% capacity factor",
-     "#ffd166"),
-    ("Air quality", f"{latest.aqi:.0f} AQI", aqi_text, aqi_color),
-    ("Battery Storage (SoC)", f"{battery_soc:.0f}%", f"Cap: {cfg['battery_capacity_kwh']} kWh", "#38bdf8"),
-    ("Net grid import", f"{net_load:.0f} kW", grid_status_text, grid_color),
-]
-
-for col, (label, value, note, color) in zip(cards, metrics):
-    col.markdown(
-        f'<div class="metric-card">'
-        f'<div class="metric-label">{label}</div>'
-        f'<div class="metric-value">{value}</div>'
-        f'<div class="metric-note" style="color:{color}">{note}</div>'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
-
-# ============================================================
-# DEMAND OUTLOOK (WITH DR CURVE)
-# ============================================================
-st.markdown("### Demand outlook & ML forecasting")
-left, right = st.columns([2.15, 1])
-
-with left:
-    recent = data.tail(144)
-    fig = go.Figure()
-
-    fig.add_trace(go.Scatter(
-        x=recent.timestamp, y=recent.load_kw,
-        name="Actual demand", line=dict(color="#5ad1e5", width=2.2)
-    ))
-
-    fig.add_trace(go.Scatter(
-        x=forecast.timestamp, y=forecast.forecast_baseline,
-        name="Baseline (0°C)", line=dict(color="#94a3b8", width=2, dash="dot")
-    ))
-
-    fig.add_trace(go.Scatter(
-        x=forecast.timestamp, y=forecast.forecast_scenario,
-        name=f"Scenario ({weather_shift:+.1f}°C)",
-        line=dict(color="#ffc857", width=2.2, dash="dash")
-    ))
-
-    if ev_shift_kw > 0:
-        fig.add_trace(go.Scatter(
-            x=forecast.timestamp, y=forecast.forecast_scenario_dr,
-            name=f"Optimized DR (-{ev_shift_kw}kW)",
-            line=dict(color="#36c98b", width=2.8)
-        ))
-
-    fig.add_trace(go.Scatter(
-        x=forecast.timestamp, y=forecast.upper,
-        line=dict(width=0), showlegend=False, hoverinfo="skip"
-    ))
-    fig.add_trace(go.Scatter(
-        x=forecast.timestamp, y=forecast.lower,
-        fill="tonexty", fillcolor="rgba(255, 200, 87, 0.14)",
-        line=dict(width=0), name="95% confidence", hoverinfo="skip"
-    ))
-
-    fig.update_layout(
+    st.markdown("### Portfolio Generation vs Demand Breakdown")
+    fig_port = go.Figure()
+    fig_port.add_trace(go.Bar(x=port_df["Campus Site"], y=port_df["Live Solar (kW)"], name="Live Solar kW", marker_color="#ffd166"))
+    fig_port.add_trace(go.Bar(x=port_df["Campus Site"], y=port_df["Live Load (kW)"], name="Live Load kW", marker_color="#5ad1e5"))
+    fig_port.update_layout(
         template="plotly_dark",
         height=380,
-        margin=dict(l=10, r=10, t=25, b=10),
+        barmode="group",
         paper_bgcolor="#0b1d2b",
         plot_bgcolor="#0b1d2b",
         legend=dict(orientation="h", y=1.12),
-        yaxis_title="kW",
-        xaxis_title=None,
+        margin=dict(l=10, r=10, t=25, b=10)
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig_port, use_container_width=True)
 
-with right:
-    peak_row = forecast.loc[forecast.forecast_scenario_dr.idxmax()]
-    delta_peak = peak_row.delta_kw - ev_shift_kw
-    delta_energy = (forecast.forecast_scenario_dr.sum() - forecast.forecast_baseline.sum()) / 2
+# ============================================================
+# SINGLE-SITE OPERATIONS MODE
+# ============================================================
+else:
+    data = generate_site_data(days, site)
+    data.loc[data.index[-1], "aqi"] = live_aqi_val
 
-    st.markdown("#### Forecast signal & DR impact")
-    st.metric("Expected peak", f"{peak_row.forecast_scenario_dr:.0f} kW",
-              peak_row.timestamp.strftime("%H:%M tomorrow"))
-    st.metric("Forecast energy", f"{forecast.forecast_scenario_dr.sum() / 2:.1f} kWh")
+    latest = data.iloc[-1]
+    forecast, meta = forecast_load(data, horizon_hours * 2, weather_shift)
 
-    if weather_shift != 0 or ev_shift_kw > 0:
-        st.metric("Net Peak Impact", f"{delta_peak:+.0f} kW")
-        cost_savings = abs(delta_energy) * cfg["tariff_inr"] if delta_energy < 0 else 0
-        if ev_shift_kw > 0:
-            st.caption(f"💰 DR Daily Savings: ₹{ev_shift_kw * cfg['tariff_inr'] * 4:,.0f}")
-        if weather_shift != 0:
-            st.caption(f"🌡️ Temp scenario cost: ₹{(forecast.delta_kw.sum()/2)*cfg['tariff_inr']:+,.0f}")
+    forecast["forecast_scenario_dr"] = np.maximum(35.0, forecast["forecast_scenario"] - ev_shift_kw)
 
-    st.caption(f"⚙️ Model: {meta['model_name']}")
-    st.caption(f"📊 Training MAPE: {meta['mape']:.2f}%  |  Residual Std: ±{meta['residual_std']:.1f} kW")
+    night = is_night_mode(latest.irradiance, latest.timestamp.hour + latest.timestamp.minute / 60)
+    aqi_text, aqi_color = aqi_label(latest.aqi)
+    solar_loss = max(0, (latest.aqi - 45) * cfg["aqi_soiling_factor"])
+
+    adjusted_load_kw = max(35.0, latest.load_kw - ev_shift_kw)
+
+    current_battery_kwh = 0.65 * cfg["battery_capacity_kwh"]
+    net_critical_load = max(10.0, adjusted_load_kw - latest.solar_kw)
+    autonomy_hours = current_battery_kwh / net_critical_load if net_critical_load > 0 else 24.0
+    critical_load_coverage_pct = min(100.0, (latest.solar_kw + (cfg["battery_capacity_kwh"] * 0.25)) / adjusted_load_kw * 100)
+
+    if simulate_outage:
+        net_load = 0.0
+        battery_soc = max(5.0, 65.0 - (1.5 / autonomy_hours * 30))
+        grid_status_text = f"🚨 Island Mode ({autonomy_hours:.1f}h reserve)"
+        grid_color = "#ef7f6d" if autonomy_hours < 4.0 else "#ffd166"
+    else:
+        net_load, battery_soc = simulate_battery_dispatch(latest.solar_kw, adjusted_load_kw, cfg["battery_capacity_kwh"], current_soc=0.65)
+        grid_status_text = "after storage & PV"
+        grid_color = "#a9c7ff"
+
+    total_historical_solar_kwh = data.solar_kw.sum() * 0.5
+    co2_saved_kg = total_historical_solar_kwh * cfg["grid_emission_factor_kg_kwh"]
+    coal_saved_kg = co2_saved_kg * 0.45
+    current_carbon_intensity = cfg["grid_emission_factor_kg_kwh"] * 1000
+    next_24h_solar_kwh = forecast.head(48).forecast_scenario.sum() * 0.25
+    next_24h_co2_offset_kg = next_24h_solar_kwh * cfg["grid_emission_factor_kg_kwh"]
+
+    st.markdown(f"# {site}")
     st.caption(
-        f"🔍 Feature importance → "
-        f"Hour: {meta['weights']['hour']}%  •  "
-        f"Temp: {meta['weights']['temperature']}%  •  "
-        f"Weekday: {meta['weights']['weekday']}%"
+        f"LIVE OPERATIONS VIEW  •  Source: {'Live (WAQI API)' if is_true_live else 'Simulation Profile'}  •  "
+        f"Refreshed: {datetime.now().strftime('%H:%M:%S')}"
     )
 
-# ============================================================
-# SOLAR + CARBON & RESILIENCE VIEW
-# ============================================================
-st.markdown("### Solar performance, carbon intelligence & resilience")
+    render_status_banner(latest, forecast, night, simulate_outage, autonomy_hours)
 
-col1, col2 = st.columns([1.55, 1])
+    cards = st.columns(5)
+    metrics = [
+        ("Grid demand", f"{adjusted_load_kw:.0f} kW", f"DR Shift: -{ev_shift_kw} kW active" if ev_shift_kw > 0 else "↗ 3.2% vs yesterday", "#71d5c1"),
+        ("Solar output", f"{latest.solar_kw:.1f} kW",
+         "🌙 Night Mode (Gated)" if night else f"{latest.solar_kw / cfg['solar_capacity_kw'] * 100:.0f}% capacity factor",
+         "#ffd166"),
+        ("Air quality", f"{latest.aqi:.0f} AQI", aqi_text, aqi_color),
+        ("Battery Storage (SoC)", f"{battery_soc:.0f}%", f"Cap: {cfg['battery_capacity_kwh']} kWh", "#38bdf8"),
+        ("Net grid import", f"{net_load:.0f} kW", grid_status_text, grid_color),
+    ]
 
-with col1:
-    solar_view = data.tail(96)
-    fig2 = make_subplots(specs=[[{"secondary_y": True}]])
-    fig2.add_trace(
-        go.Scatter(x=solar_view.timestamp, y=solar_view.solar_kw,
-                   name="PV output", line=dict(color="#ffd166", width=2.3)),
-        secondary_y=False,
+    for col, (label, value, note, color) in zip(cards, metrics):
+        col.markdown(
+            f'<div class="metric-card">'
+            f'<div class="metric-label">{label}</div>'
+            f'<div class="metric-value">{value}</div>'
+            f'<div class="metric-note" style="color:{color}">{note}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("### Demand outlook & ML forecasting")
+    left, right = st.columns([2.15, 1])
+
+    with left:
+        recent = data.tail(144)
+        fig = go.Figure()
+
+        fig.add_trace(go.Scatter(
+            x=recent.timestamp, y=recent.load_kw,
+            name="Actual demand", line=dict(color="#5ad1e5", width=2.2)
+        ))
+
+        fig.add_trace(go.Scatter(
+            x=forecast.timestamp, y=forecast.forecast_baseline,
+            name="Baseline (0°C)", line=dict(color="#94a3b8", width=2, dash="dot")
+        ))
+
+        fig.add_trace(go.Scatter(
+            x=forecast.timestamp, y=forecast.forecast_scenario,
+            name=f"Scenario ({weather_shift:+.1f}°C)",
+            line=dict(color="#ffc857", width=2.2, dash="dash")
+        ))
+
+        if ev_shift_kw > 0:
+            fig.add_trace(go.Scatter(
+                x=forecast.timestamp, y=forecast.forecast_scenario_dr,
+                name=f"Optimized DR (-{ev_shift_kw}kW)",
+                line=dict(color="#36c98b", width=2.8)
+            ))
+
+        fig.add_trace(go.Scatter(
+            x=forecast.timestamp, y=forecast.upper,
+            line=dict(width=0), showlegend=False, hoverinfo="skip"
+        ))
+        fig.add_trace(go.Scatter(
+            x=forecast.timestamp, y=forecast.lower,
+            fill="tonexty", fillcolor="rgba(255, 200, 87, 0.14)",
+            line=dict(width=0), name="95% confidence", hoverinfo="skip"
+        ))
+
+        fig.update_layout(
+            template="plotly_dark",
+            height=380,
+            margin=dict(l=10, r=10, t=25, b=10),
+            paper_bgcolor="#0b1d2b",
+            plot_bgcolor="#0b1d2b",
+            legend=dict(orientation="h", y=1.12),
+            yaxis_title="kW",
+            xaxis_title=None,
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    with right:
+        peak_row = forecast.loc[forecast.forecast_scenario_dr.idxmax()]
+        delta_peak = peak_row.delta_kw - ev_shift_kw
+        delta_energy = (forecast.forecast_scenario_dr.sum() - forecast.forecast_baseline.sum()) / 2
+
+        st.markdown("#### Forecast signal & DR impact")
+        st.metric("Expected peak", f"{peak_row.forecast_scenario_dr:.0f} kW",
+                  peak_row.timestamp.strftime("%H:%M tomorrow"))
+        st.metric("Forecast energy", f"{forecast.forecast_scenario_dr.sum() / 2:.1f} kWh")
+
+        if weather_shift != 0 or ev_shift_kw > 0:
+            st.metric("Net Peak Impact", f"{delta_peak:+.0f} kW")
+            if ev_shift_kw > 0:
+                st.caption(f"💰 DR Daily Savings: ₹{ev_shift_kw * cfg['tariff_inr'] * 4:,.0f}")
+
+        st.caption(f"⚙️ Model: {meta['model_name']}")
+        st.caption(f"📊 Training MAPE: {meta['mape']:.2f}%  |  Residual Std: ±{meta['residual_std']:.1f} kW")
+
+    st.markdown("### Solar performance, carbon intelligence & resilience")
+
+    col1, col2 = st.columns([1.55, 1])
+
+    with col1:
+        solar_view = data.tail(96)
+        fig2 = make_subplots(specs=[[{"secondary_y": True}]])
+        fig2.add_trace(
+            go.Scatter(x=solar_view.timestamp, y=solar_view.solar_kw,
+                       name="PV output", line=dict(color="#ffd166", width=2.3)),
+            secondary_y=False,
+        )
+        fig2.add_trace(
+            go.Scatter(x=solar_view.timestamp, y=solar_view.aqi,
+                       name="AQI", line=dict(color="#ef7f6d", width=1.7)),
+            secondary_y=True,
+        )
+        fig2.update_layout(
+            template="plotly_dark",
+            height=340,
+            margin=dict(l=10, r=10, t=20, b=10),
+            paper_bgcolor="#0b1d2b",
+            plot_bgcolor="#0b1d2b",
+            legend=dict(orientation="h", y=1.12),
+        )
+        fig2.update_yaxes(title_text="Solar kW", secondary_y=False)
+        fig2.update_yaxes(title_text="AQI", secondary_y=True)
+        st.plotly_chart(fig2, use_container_width=True)
+
+    with col2:
+        st.markdown("#### 🌱 Carbon Intelligence")
+        cc1, cc2 = st.columns(2)
+        cc1.metric("CO₂ Offset (Total)", f"{co2_saved_kg / 1000:.2f} tons", f"{coal_saved_kg:.0f} kg coal")
+        cc2.metric("Grid Intensity", f"{current_carbon_intensity:.0f} g/kWh", "regional baseline")
+        st.caption(f"🔮 Projected next-24h offset: **{next_24h_co2_offset_kg:.1f} kg CO₂**")
+        
+        st.markdown("---")
+        st.markdown(f"#### 🛡️ Microgrid Resilience & Islandability")
+        rc1, rc2 = st.columns(2)
+        rc1.metric("Autonomy Reserve", f"{autonomy_hours:.1f} hours", "at current net load")
+        rc2.metric("Critical Coverage", f"{critical_load_coverage_pct:.0f}%", "solar + battery capacity")
+        
+        status_badge = "🟢 Islandable (Secure)" if autonomy_hours >= 4.0 else "🔴 At Risk (Shed Load)"
+        st.caption(f"Status: **{status_badge}** • Storage Capacity: {cfg['battery_capacity_kwh']} kWh")
+
+    csv = forecast[["timestamp", "forecast_baseline", "forecast_scenario", "forecast_scenario_dr", "lower", "upper"]].to_csv(index=False)
+    st.sidebar.download_button(
+        "📥 Download Forecast CSV",
+        data=csv,
+        file_name=f"gridsight_forecast_{site.replace(' ', '_')}.csv",
+        mime="text/csv",
     )
-    fig2.add_trace(
-        go.Scatter(x=solar_view.timestamp, y=solar_view.aqi,
-                   name="AQI", line=dict(color="#ef7f6d", width=1.7)),
-        secondary_y=True,
-    )
-    fig2.update_layout(
-        template="plotly_dark",
-        height=340,
-        margin=dict(l=10, r=10, t=20, b=10),
-        paper_bgcolor="#0b1d2b",
-        plot_bgcolor="#0b1d2b",
-        legend=dict(orientation="h", y=1.12),
-    )
-    fig2.update_yaxes(title_text="Solar kW", secondary_y=False)
-    fig2.update_yaxes(title_text="AQI", secondary_y=True)
-    st.plotly_chart(fig2, use_container_width=True)
-
-with col2:
-    st.markdown("#### 🌱 Carbon Intelligence")
-    cc1, cc2 = st.columns(2)
-    cc1.metric("CO₂ Offset (Total)", f"{co2_saved_kg / 1000:.2f} tons", f"{coal_saved_kg:.0f} kg coal")
-    cc2.metric("Grid Intensity", f"{current_carbon_intensity:.0f} g/kWh", "regional baseline")
-    st.caption(f"🔮 Projected next-24h offset: **{next_24h_co2_offset_kg:.1f} kg CO₂**")
-    
-    st.markdown("---")
-    st.markdown(f"#### 🛡️ Microgrid Resilience & Islandability")
-    rc1, rc2 = st.columns(2)
-    rc1.metric("Autonomy Reserve", f"{autonomy_hours:.1f} hours", "at current net load")
-    rc2.metric("Critical Coverage", f"{critical_load_coverage_pct:.0f}%", "solar + battery capacity")
-    
-    status_badge = "🟢 Islandable (Secure)" if autonomy_hours >= 4.0 else "🔴 At Risk (Shed Load)"
-    st.caption(f"Status: **{status_badge}** • Storage Capacity: {cfg['battery_capacity_kwh']} kWh")
-
-# ============================================================
-# DOWNLOAD & EXPANDER
-# ============================================================
-csv = forecast[["timestamp", "forecast_baseline", "forecast_scenario", "forecast_scenario_dr", "lower", "upper"]].to_csv(index=False)
-st.sidebar.download_button(
-    "📥 Download Forecast CSV",
-    data=csv,
-    file_name=f"gridsight_forecast_{site.replace(' ', '_')}.csv",
-    mime="text/csv",
-)
-
-with st.expander("Data model and integration notes"):
-    st.markdown(f"""
-**Current model:** 30-minute site observations with site-specific load shapes (`industrial` / `office` / `commercial` / `mixed`).  
-Demand is forecast with **Ridge Regression + cyclic Fourier terms + amplified HVAC temperature sensitivity**.  
-
-**Advanced Layers:** Real-time WAQI API telemetry with regional atmospheric scaling, an interactive **Demand Response Simulator** (live DR curve adjustment & tariff savings), and an **Outage Resilience & Islanding Mode** featuring dynamic autonomy countdowns and critical load coverage metrics.
-""")
