@@ -512,21 +512,44 @@ with st.sidebar:
     st.markdown("## ⚡ GridSight")
     st.caption("Microgrid command center")
 
-    view_mode = st.radio("Command Mode", ["Single-Site Operations", "🌐 Portfolio Executive Overview"])
+    view_mode = st.radio(
+        "Command Mode",
+        ["Single-Site Operations", "🌐 Portfolio Executive Overview"],
+        help="Switch between deep-dive telemetry for a single campus or high-level fleet-wide executive tracking.",
+    )
     st.divider()
 
     if view_mode == "Single-Site Operations":
-        site = st.selectbox("Site", list(SITES.keys()))
+        site = st.selectbox(
+            "Site",
+            list(SITES.keys()),
+            help="Select which regional campus control room to inspect.",
+        )
         cfg = SITES[site]
 
-        days = st.slider("Historical data window (Days)", 7, 60, 21)
-        horizon_hours = st.select_slider("Forecast horizon", options=[12, 24, 36, 48, 72], value=24)
-        weather_shift = st.slider("Temperature scenario (°C)", -4, 8, 0)
+        days = st.slider(
+            "Historical data window (Days)", 7, 60, 21,
+            help="Number of past operational days fed into the machine learning training pipeline.",
+        )
+        horizon_hours = st.select_slider(
+            "Forecast horizon", options=[12, 24, 36, 48, 72], value=24,
+            help="How many hours into the future the Ridge Regression model predicts energy load.",
+        )
+        weather_shift = st.slider(
+            "Temperature scenario (°C)", -4, 8, 0,
+            help="Simulate a temperature shift (e.g. heatwave) to test how HVAC loads spike campus electricity demand.",
+        )
 
         st.divider()
         st.markdown("**🛡️ Resilience & Demand Response**")
-        simulate_outage = st.checkbox("🚨 Simulate Grid Blackout (Island Mode)", value=False)
-        ev_shift_kw = st.slider("⚡ EV Fleet Load Shifting (kW)", 0, 50, 0, step=5, key="ev_shift_kw_slider")
+        simulate_outage = st.checkbox(
+            "🚨 Simulate Grid Blackout (Island Mode)", value=False,
+            help="Cuts utility grid input to test autonomous microgrid survival on local solar and battery storage.",
+        )
+        ev_shift_kw = st.slider(
+            "⚡ EV Fleet Load Shifting (kW)", 0, 50, 0, step=5, key="ev_shift_kw_slider",
+            help="Defer flexible industrial or EV charging loads to flatten peak demand and reduce electricity bills.",
+        )
     else:
         site = "Pune Industrial Campus"
         cfg = SITES[site]
@@ -574,6 +597,8 @@ st.markdown("""
 .metric-label { color: #9bb6c7; font-size: 0.78rem; text-transform: uppercase; letter-spacing: .08em; }
 .metric-value { font-size: 1.8rem; font-weight: 700; margin: 5px 0; }
 .metric-note { font-size: .82rem; }
+.info-icon { cursor: help; opacity: 0.55; font-size: 0.85em; margin-left: 4px; }
+.info-icon:hover { opacity: 1; }
 h1, h2, h3 { color: #f4fbff !important; }
 .stPlotlyChart {
     border: 1px solid %s;
@@ -628,13 +653,31 @@ if view_mode == "🌐 Portfolio Executive Overview":
     port_df = pd.DataFrame(portfolio_rows)
 
     p1, p2, p3, p4 = st.columns(4)
-    p1.metric("Total Portfolio Solar Output", f"{total_portfolio_solar:.1f} kW", f"across {len(SITES)} campuses")
-    p2.metric("Total Portfolio Load Demand", f"{total_portfolio_load:.1f} kW", "live aggregate")
-    p3.metric("Combined CO₂ Offsets", f"{total_portfolio_co2:.2f} tons", "lifetime renewable impact")
-    p4.metric("Total Economic Value", f"₹{total_cost_avoided_inr:,.0f}", "solar offset + battery arbitrage")
+    p1.metric("Total Portfolio Solar Output", f"{total_portfolio_solar:.1f} kW", f"across {len(SITES)} campuses",
+              help="Sum of current solar generation across all campuses.")
+    p2.metric("Total Portfolio Load Demand", f"{total_portfolio_load:.1f} kW", "live aggregate",
+              help="Sum of current electricity demand across all campuses.")
+    p3.metric("Combined CO₂ Offsets", f"{total_portfolio_co2:.2f} tons", "lifetime renewable impact",
+              help="Sum of estimated CO₂ avoided from solar generation across all campuses, over the last 14 days.")
+    p4.metric("Total Economic Value", f"₹{total_cost_avoided_inr:,.0f}", "solar offset + battery arbitrage",
+              help="Sum of estimated solar cost savings plus estimated battery peak-shaving savings, across all campuses, over the last 14 days.")
 
     st.markdown("### Campus Economic & Performance Matrix")
-    st.dataframe(port_df, use_container_width=True, hide_index=True)
+    st.dataframe(
+        port_df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Solar Cap (kW)": st.column_config.NumberColumn(help="Installed rooftop solar capacity at this campus."),
+            "Live Solar (kW)": st.column_config.NumberColumn(help="Current solar generation."),
+            "Live Load (kW)": st.column_config.NumberColumn(help="Current electricity demand."),
+            "Live AQI": st.column_config.NumberColumn(help="Current Air Quality Index — live where a WAQI token is configured, otherwise simulated."),
+            "Tariff (₹/kWh)": st.column_config.NumberColumn(help="Base electricity tariff assumed for this campus."),
+            "Solar Savings (₹)": st.column_config.NumberColumn(help="Estimated money saved from on-site solar generation over the last 14 days."),
+            "Arbitrage Savings (₹)": st.column_config.NumberColumn(help="Estimated savings from battery peak-shaving dispatch over the last 14 days."),
+            "CO₂ Offset (Tons)": st.column_config.NumberColumn(help="Estimated CO₂ emissions avoided from solar generation over the last 14 days."),
+        },
+    )
 
     st.markdown("### Portfolio Generation vs Demand Breakdown")
     fig_port = go.Figure()
@@ -729,23 +772,29 @@ else:
                 "✅ Apply", use_container_width=True, key="apply_recommendation",
                 on_click=apply_recommendation,
                 args=(site, recommendation["shift_kw"], recommendation["savings_inr"], recommendation["co2_avoided_kg"]),
+                help="Sets the EV Fleet Load Shifting slider to this suggested value and logs the estimated savings to This Month, You Saved below.",
             )
 
     cards = st.columns(5)
     metrics = [
-        ("Grid demand", f"{adjusted_load_kw:.0f} kW", f"DR Shift: -{ev_shift_kw} kW active" if ev_shift_kw > 0 else f"Tariff: ₹{cfg['tariff_inr']}/kWh", "#71d5c1"),
+        ("Grid demand", f"{adjusted_load_kw:.0f} kW", f"DR Shift: -{ev_shift_kw} kW active" if ev_shift_kw > 0 else f"Tariff: ₹{cfg['tariff_inr']}/kWh", "#71d5c1",
+         "Current electricity demand at this site, after any EV load-shifting from the sidebar or an applied recommendation."),
         ("Solar output", f"{latest.solar_kw:.1f} kW",
          "🌙 Night Mode (Gated)" if night else f"{latest.solar_kw / cfg['solar_capacity_kw'] * 100:.0f}% capacity factor",
-         "#ffd166"),
-        ("Air quality", f"{latest.aqi:.0f} AQI", aqi_text, aqi_color),
-        ("Battery Storage (SoC)", f"{battery_soc:.0f}%", dispatch_mode, "#38bdf8"),
-        ("Net grid import", f"{net_load:.0f} kW", grid_status_text, grid_color),
+         "#ffd166",
+         "Current on-site solar generation, shown as a % of this site's installed solar capacity. Gated to zero automatically at night."),
+        ("Air quality", f"{latest.aqi:.0f} AQI", aqi_text, aqi_color,
+         "Current Air Quality Index. A live WAQI reading when a token is configured in secrets, otherwise a simulated value."),
+        ("Battery Storage (SoC)", f"{battery_soc:.0f}%", dispatch_mode, "#38bdf8",
+         "State of charge of the on-site battery, and what it is currently doing: charging from solar surplus, discharging to shave peak demand, or idle."),
+        ("Net grid import", f"{net_load:.0f} kW", grid_status_text, grid_color,
+         "Power currently being drawn from the public grid, after solar generation and battery dispatch."),
     ]
 
-    for col, (label, value, note, color) in zip(cards, metrics):
+    for col, (label, value, note, color, tooltip) in zip(cards, metrics):
         col.markdown(
             f'<div class="metric-card">'
-            f'<div class="metric-label">{label}</div>'
+            f'<div class="metric-label">{label} <span class="info-icon" title="{tooltip}">ⓘ</span></div>'
             f'<div class="metric-value">{value}</div>'
             f'<div class="metric-note" style="color:{color}">{note}</div>'
             f'</div>',
@@ -809,14 +858,19 @@ else:
 
         st.markdown("#### Forecast signal & Economics")
         st.metric("Expected peak", f"{peak_row.forecast_scenario_dr:.0f} kW",
-                  peak_row.timestamp.strftime("%H:%M tomorrow"))
-        st.metric("Solar Cost Avoided", f"₹{solar_cost_avoided:,.0f}", f"at ₹{cfg['tariff_inr']}/kWh")
-        st.metric("Arbitrage Savings", f"₹{arbitrage_savings:,.0f}", "peak shaving dispatch")
+                  peak_row.timestamp.strftime("%H:%M tomorrow"),
+                  help="The highest predicted demand within the forecast horizon, and when it's expected to occur.")
+        st.metric("Solar Cost Avoided", f"₹{solar_cost_avoided:,.0f}", f"at ₹{cfg['tariff_inr']}/kWh",
+                  help="Estimated money saved by using on-site solar instead of buying that energy from the grid, summed over the historical window shown in the chart.")
+        st.metric("Arbitrage Savings", f"₹{arbitrage_savings:,.0f}", "peak shaving dispatch",
+                  help="Estimated savings from the battery discharging during expensive peak-tariff hours instead of drawing that energy from the grid.")
 
         if weather_shift != 0:
-            st.metric("Weather Peak Impact", f"{peak_row.delta_kw:+.0f} kW", "vs. baseline temperature")
+            st.metric("Weather Peak Impact", f"{peak_row.delta_kw:+.0f} kW", "vs. baseline temperature",
+                      help="How much the Temperature scenario slider is changing the forecasted peak demand, compared to the current weather baseline.")
         if ev_shift_kw > 0:
-            st.metric("DR Peak Reduction", f"-{ev_shift_kw:.0f} kW", "flat demand-response shift")
+            st.metric("DR Peak Reduction", f"-{ev_shift_kw:.0f} kW", "flat demand-response shift",
+                      help="How much the EV Fleet Load Shifting slider is reducing forecasted peak demand.")
             st.caption(f"💰 DR Daily Savings: ₹{ev_shift_kw * cfg['tariff_inr'] * 4:,.0f}")
 
         st.caption(f"⚙️ Model: {meta['model_name']}")
@@ -855,8 +909,10 @@ else:
     with col2:
         st.markdown("#### 🌱 Carbon Intelligence & SQLite Logs")
         cc1, cc2 = st.columns(2)
-        cc1.metric("CO₂ Offset (Total)", f"{co2_saved_kg / 1000:.2f} tons", f"{coal_saved_kg:.0f} kg coal")
-        cc2.metric("Grid Intensity", f"{current_carbon_intensity:.0f} g/kWh", "regional baseline")
+        cc1.metric("CO₂ Offset (Total)", f"{co2_saved_kg / 1000:.2f} tons", f"{coal_saved_kg:.0f} kg coal",
+                   help="Estimated CO₂ emissions avoided by on-site solar generation over the historical window shown, versus drawing that energy from the grid.")
+        cc2.metric("Grid Intensity", f"{current_carbon_intensity:.0f} g/kWh", "regional baseline",
+                   help="Assumed carbon intensity of grid electricity for this site's region — used to convert solar kWh into CO₂ avoided.")
         st.caption(f"🔮 Projected next-24h offset: **{next_24h_co2_offset_kg:.1f} kg CO₂**")
 
         cursor = db_conn.cursor()
@@ -867,8 +923,10 @@ else:
         st.markdown("---")
         st.markdown(f"#### 🛡️ Microgrid Resilience & Islandability")
         rc1, rc2 = st.columns(2)
-        rc1.metric("Autonomy Reserve", f"{autonomy_hours:.1f} hours", "at current net load")
-        rc2.metric("Critical Coverage", f"{critical_load_coverage_pct:.0f}%", "solar + battery capacity")
+        rc1.metric("Autonomy Reserve", f"{autonomy_hours:.1f} hours", "at current net load",
+                   help="How many hours the battery could sustain the current net critical load if the grid went offline right now.")
+        rc2.metric("Critical Coverage", f"{critical_load_coverage_pct:.0f}%", "solar + battery capacity",
+                   help="Estimated share of current demand that solar + battery together could cover without any grid import.")
 
         status_badge = "🟢 Islandable (Secure)" if autonomy_hours >= 4.0 else "🔴 At Risk (Shed Load)"
         st.caption(f"Status: **{status_badge}** • Storage Capacity: {cfg['battery_capacity_kwh']} kWh")
@@ -885,9 +943,12 @@ else:
     month_savings, month_co2, month_shift_kw, month_count = month_cursor.fetchone()
 
     mc1, mc2, mc3 = st.columns(3)
-    mc1.metric("💰 Total Saved", f"₹{month_savings:,.0f}", f"{month_count} recommendation(s) applied")
-    mc2.metric("🌱 CO₂ Avoided", f"{month_co2:.1f} kg", "from load-shifting decisions")
-    mc3.metric("⚡ Peak Demand Reduced", f"{month_shift_kw:.0f} kW", "cumulative across decisions")
+    mc1.metric("💰 Total Saved", f"₹{month_savings:,.0f}", f"{month_count} recommendation(s) applied",
+               help="Sum of estimated savings from every Recommendation Engine suggestion you've applied for this site this month.")
+    mc2.metric("🌱 CO₂ Avoided", f"{month_co2:.1f} kg", "from load-shifting decisions",
+               help="Estimated CO₂ avoided from the load-shifting decisions you've applied this month.")
+    mc3.metric("⚡ Peak Demand Reduced", f"{month_shift_kw:.0f} kW", "cumulative across decisions",
+               help="Total kW shifted out of peak hours, added up across every applied recommendation this month.")
     st.caption("Tracked since this app instance started — resets on redeploy, same as the SQLite telemetry log above.")
 
     csv = forecast[["timestamp", "forecast_baseline", "forecast_scenario", "forecast_scenario_dr", "lower", "upper"]].to_csv(index=False)
@@ -896,4 +957,5 @@ else:
         data=csv,
         file_name=f"gridsight_forecast_{site.replace(' ', '_')}.csv",
         mime="text/csv",
+        help="Downloads the demand forecast — baseline, weather-scenario, and DR-adjusted — as a CSV file.",
     )
