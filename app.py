@@ -467,6 +467,30 @@ def apply_recommendation(site_name: str, shift_kw: float, savings_inr: float, co
     st.session_state["ev_shift_kw_slider"] = int(shift_kw)
     log_decision(site_name, shift_kw, savings_inr, co2_avoided_kg)
 
+# ============================================================
+# ONE-CLICK SCENARIO PRESETS — same callback-before-rerun pattern as
+# apply_recommendation above, driving the existing sidebar controls
+# directly so nothing downstream needs special-casing.
+# ============================================================
+def trigger_dust_storm():
+    st.session_state["dust_storm_checkbox"] = True
+
+def trigger_heatwave():
+    st.session_state["weather_shift_slider"] = 8
+
+def trigger_blackout():
+    st.session_state["simulate_outage_checkbox"] = True
+
+def reset_all_scenarios():
+    st.session_state["dust_storm_checkbox"] = False
+    st.session_state["weather_shift_slider"] = 0
+    st.session_state["simulate_outage_checkbox"] = False
+    st.session_state["ev_shift_kw_slider"] = 0
+    # Also restore battery charge for every site — otherwise a battery drained
+    # during a blackout test would confusingly stay drained in "normal" mode.
+    for name in SITES:
+        st.session_state.battery_soc[name] = 65.0
+
 def render_status_banner(latest, forecast, night: bool, outage: bool, autonomy_hours: float):
     messages = []
     if outage:
@@ -500,10 +524,18 @@ def render_status_banner(latest, forecast, night: bool, outage: bool, autonomy_h
             st.info(text, icon="ℹ️")
 
 # ============================================================
-# SESSION STATE — per-site battery charge, carried across reruns
+# SESSION STATE — per-site battery charge, carried across reruns.
+# Scenario-controlled widget defaults are also seeded here (once) rather
+# than passed as a `value=` kwarg on the widget itself, since a widget
+# with both a `value=` and a callback-set session_state entry triggers a
+# (harmless but noisy) Streamlit policy warning.
 # ============================================================
 if "battery_soc" not in st.session_state:
     st.session_state.battery_soc = {name: 65.0 for name in SITES}
+st.session_state.setdefault("weather_shift_slider", 0)
+st.session_state.setdefault("simulate_outage_checkbox", False)
+st.session_state.setdefault("dust_storm_checkbox", False)
+st.session_state.setdefault("ev_shift_kw_slider", 0)
 
 # ============================================================
 # SIDEBAR
@@ -536,24 +568,29 @@ with st.sidebar:
             help="How many hours into the future the Ridge Regression model predicts energy load.",
         )
         weather_shift = st.slider(
-            "Temperature scenario (°C)", -4, 8, 0,
+            "Temperature scenario (°C)", -4, 8, key="weather_shift_slider",
             help="Simulate a temperature shift (e.g. heatwave) to test how HVAC loads spike campus electricity demand.",
         )
 
         st.divider()
         st.markdown("**🛡️ Resilience & Demand Response**")
         simulate_outage = st.checkbox(
-            "🚨 Simulate Grid Blackout (Island Mode)", value=False,
+            "🚨 Simulate Grid Blackout (Island Mode)", key="simulate_outage_checkbox",
             help="Cuts utility grid input to test autonomous microgrid survival on local solar and battery storage.",
         )
+        dust_storm_active = st.checkbox(
+            "🌪️ Simulate a Dust Storm", key="dust_storm_checkbox",
+            help="Spikes AQI to a severe dust-storm level and dramatically derates solar output via heavy panel soiling — a stress-test scenario, not calibrated real-world physics.",
+        )
         ev_shift_kw = st.slider(
-            "⚡ EV Fleet Load Shifting (kW)", 0, 50, 0, step=5, key="ev_shift_kw_slider",
+            "⚡ EV Fleet Load Shifting (kW)", 0, 50, step=5, key="ev_shift_kw_slider",
             help="Defer flexible industrial or EV charging loads to flatten peak demand and reduce electricity bills.",
         )
     else:
         site = "Pune Industrial Campus"
         cfg = SITES[site]
         simulate_outage = False
+        dust_storm_active = False
         ev_shift_kw = 0
         weather_shift = 0
 
@@ -599,6 +636,23 @@ st.markdown("""
 .metric-note { font-size: .82rem; }
 .info-icon { cursor: help; opacity: 0.55; font-size: 0.85em; margin-left: 4px; }
 .info-icon:hover { opacity: 1; }
+@keyframes mvp-pulse {
+    0%%, 100%% { opacity: 1; text-shadow: 0 0 6px rgba(239, 127, 109, 0.8); }
+    50%% { opacity: 0.55; text-shadow: 0 0 14px rgba(239, 127, 109, 1); }
+}
+.mvp-badge {
+    text-align: center; color: #ef7f6d; font-weight: 700; font-size: 0.72rem;
+    text-transform: uppercase; letter-spacing: .06em; margin-bottom: 6px;
+    animation: mvp-pulse 1.6s ease-in-out infinite;
+}
+@keyframes glow-border {
+    0%%, 100%% { box-shadow: 0 0 6px rgba(239, 127, 109, 0.4); }
+    50%% { box-shadow: 0 0 18px rgba(239, 127, 109, 0.9); }
+}
+.scorecard-box {
+    border-radius: 16px; padding: 20px; margin: 10px 0 18px 0;
+    border: 2px solid #7f2a2a; animation: glow-border 1.8s ease-in-out infinite;
+}
 h1, h2, h3 { color: #f4fbff !important; }
 .stPlotlyChart {
     border: 1px solid %s;
@@ -679,7 +733,10 @@ if view_mode == "🌐 Portfolio Executive Overview":
         },
     )
 
-    st.markdown("### Portfolio Generation vs Demand Breakdown")
+    st.subheader(
+        "Portfolio Generation vs Demand Breakdown",
+        help="Compares live solar generation against live demand at each campus, side by side — a quick way to spot which sites are net exporters vs importers of grid power right now.",
+    )
     fig_port = go.Figure()
     fig_port.add_trace(go.Bar(x=port_df["Campus Site"], y=port_df["Live Solar (kW)"], name="Live Solar kW", marker_color="#ffd166"))
     fig_port.add_trace(go.Bar(x=port_df["Campus Site"], y=port_df["Live Load (kW)"], name="Live Load kW", marker_color="#5ad1e5"))
@@ -702,6 +759,14 @@ else:
     data.loc[data.index[-1], "aqi"] = live_aqi_val
 
     latest = data.iloc[-1]
+    if dust_storm_active:
+        # Scenario stress-test override — deliberately more severe than the
+        # calibrated aqi_soiling_factor model, so the effect reads clearly in
+        # a live demo. Only the current-snapshot row is overridden; the
+        # historical chart and forecast are untouched by this toggle.
+        latest = latest.copy()
+        latest["aqi"] = 380.0
+        latest["solar_kw"] = latest["solar_kw"] * 0.25
     current_hour = latest.timestamp.hour + latest.timestamp.minute / 60
     forecast, meta = forecast_load(data, horizon_hours * 2, weather_shift)
 
@@ -754,7 +819,59 @@ else:
         f"Refreshed: {datetime.now().strftime('%H:%M:%S')}"
     )
 
+    st.markdown("#### 🎮 One-Click Scenario Playground")
+    st.caption("No sliders to hunt for — hit a button and watch the microgrid react instantly.")
+    p_col1, p_col2, p_col3, p_col4 = st.columns([1, 1, 1.2, 0.7])
+    with p_col1:
+        st.button(
+            "🌪️ Simulate a Dust Storm", use_container_width=True, on_click=trigger_dust_storm,
+            help="Spikes AQI to a severe dust-storm level and heavily derates solar output via panel soiling.",
+        )
+    with p_col2:
+        st.button(
+            "🌡️ Simulate a 45°C Heatwave", use_container_width=True, on_click=trigger_heatwave,
+            help="Maxes out the Temperature scenario slider and re-runs the ML demand forecast under that heat load.",
+        )
+    with p_col3:
+        st.markdown('<div class="mvp-badge">🔴 What happens if the city grid dies right now?</div>', unsafe_allow_html=True)
+        st.button(
+            "🚨 Test Microgrid Survivability", use_container_width=True, on_click=trigger_blackout,
+            help="The ultimate stress test: cuts the grid entirely and starts the live Autonomy Scorecard below.",
+        )
+    with p_col4:
+        st.button(
+            "↺ Reset", use_container_width=True, on_click=reset_all_scenarios,
+            help="Clears every active scenario and returns to normal operations.",
+        )
+
     render_status_banner(latest, forecast, night, simulate_outage, autonomy_hours)
+
+    if dust_storm_active:
+        st.caption("🌪️ **Dust Storm scenario active** — the AQI and solar figures above are dramatized for this demo, not live or calibrated-simulation telemetry.")
+
+    if simulate_outage:
+        if autonomy_hours >= 4.0:
+            verdict, verdict_color = "🏆 SURVIVED — Grid-Independent", "#36c98b"
+        elif autonomy_hours >= 1.0:
+            verdict, verdict_color = "⚠️ AT RISK — Shed Load Soon", "#ffc857"
+        else:
+            verdict, verdict_color = "💀 BLACKOUT IMMINENT", "#f47c67"
+
+        st.markdown(
+            '<div class="scorecard-box" style="background: linear-gradient(135deg, #2a0f0f, #1a0808);">'
+            '<div style="text-transform:uppercase; letter-spacing:.08em; color:#c98787; font-size:0.8rem; margin-bottom:6px;">🏆 Autonomy Scorecard — Live Survival Test</div>'
+            f'<div style="font-size:1.9rem; font-weight:800; color:{verdict_color}; margin-bottom:10px;">{verdict}</div>'
+            '<div style="display:flex; gap:32px; flex-wrap:wrap;">'
+            '<div><div style="color:#9bb6c7; font-size:0.75rem; text-transform:uppercase;">Battery Drain Rate</div>'
+            f'<div style="font-size:1.3rem; font-weight:700;">{net_critical_load:.0f} kW</div></div>'
+            '<div><div style="color:#9bb6c7; font-size:0.75rem; text-transform:uppercase;">Energy Remaining</div>'
+            f'<div style="font-size:1.3rem; font-weight:700;">{current_battery_kwh:.0f} kWh</div></div>'
+            '<div><div style="color:#9bb6c7; font-size:0.75rem; text-transform:uppercase;">Time to Depletion</div>'
+            f'<div style="font-size:1.3rem; font-weight:700;">{int(autonomy_hours)}h {int((autonomy_hours % 1) * 60)}m</div></div>'
+            '</div></div>',
+            unsafe_allow_html=True,
+        )
+        st.caption("This countdown recalculates every time you touch a control while blackout mode is active — drag any slider and watch it drop.")
 
     recommendation = None if simulate_outage else generate_recommendation(forecast, cfg, ev_shift_kw)
     if recommendation:
@@ -801,7 +918,10 @@ else:
             unsafe_allow_html=True,
         )
 
-    st.markdown("### Demand outlook & ML forecasting")
+    st.subheader(
+        "Demand outlook & ML forecasting",
+        help="Blue: actual recorded demand. Grey dotted: the ML model's baseline forecast using current weather. Yellow dashed: forecast under your Temperature scenario setting. Shaded band: the model's uncertainty range. Green (when EV Fleet Load Shifting is active): demand after that shift is applied.",
+    )
     left, right = st.columns([2.15, 1])
 
     with left:
@@ -876,7 +996,10 @@ else:
         st.caption(f"⚙️ Model: {meta['model_name']}")
         st.caption(f"📊 Training MAPE: {meta['mape']:.2f}%  |  Residual Std: ±{meta['residual_std']:.1f} kW")
 
-    st.markdown("### Solar performance, carbon intelligence & resilience")
+    st.subheader(
+        "Solar performance, carbon intelligence & resilience",
+        help="Left chart: on-site solar output (yellow) against Air Quality Index (red) over the last 48 hours — shows how AQI-driven soiling reduces panel output as pollution rises. Right panels: cumulative CO₂ savings and how long the battery could sustain critical load if the grid failed right now.",
+    )
 
     col1, col2 = st.columns([1.55, 1])
 
