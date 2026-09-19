@@ -404,7 +404,7 @@ adjusted_load_kw = max(35.0, latest.load_kw - ev_shift_kw)
 # Handle Outage Simulation vs Normal Operation
 if simulate_outage:
     net_load = 0.0
-    battery_soc = 35.0 # Battery draining to support islanding
+    battery_soc = 35.0
     grid_status_text = "🚨 Island Mode (Grid Down)"
     grid_color = "#ef7f6d"
 else:
@@ -429,15 +429,16 @@ st.caption(
 render_status_banner(latest, forecast, night, simulate_outage)
 
 # ============================================================
-# METRIC CARDS
+# METRIC CARDS (5-COLUMN LAYOUT)
 # ============================================================
-cards = st.columns(4)
+cards = st.columns(5)
 metrics = [
     ("Grid demand", f"{adjusted_load_kw:.0f} kW", f"DR Shift: -{ev_shift_kw} kW" if ev_shift_kw > 0 else "↗ 3.2% vs yesterday", "#71d5c1"),
     ("Solar output", f"{latest.solar_kw:.1f} kW",
      "🌙 Night Mode (Solar Gated)" if night else f"{latest.solar_kw / cfg['solar_capacity_kw'] * 100:.0f}% capacity factor",
      "#ffd166"),
-    ("Battery Storage (SoC)", f"{battery_soc:.0f}%", f"Capacity: {cfg['battery_capacity_kwh']} kWh", "#38bdf8"),
+    ("Air quality", f"{latest.aqi:.0f} AQI", aqi_text, aqi_color),
+    ("Battery Storage (SoC)", f"{battery_soc:.0f}%", f"Cap: {cfg['battery_capacity_kwh']} kWh", "#38bdf8"),
     ("Net grid import", f"{net_load:.0f} kW", grid_status_text, grid_color),
 ]
 
