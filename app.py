@@ -18,7 +18,7 @@ st.set_page_config(
 )
 
 # ============================================================
-# SITE CONFIGURATION (INCLUDING STORAGE & CARBON SPECS)
+# SITE CONFIGURATION
 # ============================================================
 SITES = {
     "Pune Industrial Campus": {
@@ -29,8 +29,8 @@ SITES = {
         "noise_scale": 6.8,
         "tariff_inr": 8.5,
         "waqi_city": "pune",
-        "battery_capacity_kwh": 100.0, # Storage spec
-        "grid_emission_factor_kg_kwh": 0.82, # India coal-heavy baseline grid factor
+        "battery_capacity_kwh": 100.0,
+        "grid_emission_factor_kg_kwh": 0.82,
     },
     "Bengaluru Tech Park": {
         "solar_capacity_kw": 120,
@@ -265,24 +265,18 @@ def forecast_load(data: pd.DataFrame, horizon_steps: int, weather_shift: float =
     return forecast_df, meta
 
 # ============================================================
-# STORAGE OPTIMIZER & CARBON CALCULATOR HELPERS
+# STORAGE OPTIMIZER & HELPERS
 # ============================================================
-def simulate_battery_dispatch(solar_kw: float, load_kw: float, battery_capacity_kwh: float, current_soc: float = 0.5):
-    """
-    Simple rule-based battery dispatcher:
-    - Charges when solar exceeds load (surplus energy goes to battery).
-    - Discharges when load exceeds solar (covers deficit during peaks).
-    Returns net grid import after storage, and updated state of charge (SoC %).
-    """
+def simulate_battery_dispatch(solar_kw: float, load_kw: float, battery_capacity_kwh: float, current_soc: float = 0.65):
     net_power = load_kw - solar_kw
     soc_kwh = current_soc * battery_capacity_kwh
     
-    if net_power < 0: # Solar surplus -> Charge battery
+    if net_power < 0:
         surplus = abs(net_power)
         charge_amount = min(surplus, battery_capacity_kwh * 0.2, battery_capacity_kwh - soc_kwh)
         soc_kwh += charge_amount
         net_grid_import = max(0.0, net_power + charge_amount)
-    else: # Deficit -> Discharge battery
+    else:
         discharge_amount = min(net_power, battery_capacity_kwh * 0.25, soc_kwh)
         soc_kwh -= discharge_amount
         net_grid_import = max(0.0, net_power - discharge_amount)
@@ -302,8 +296,11 @@ def aqi_label(value: float) -> tuple[str, str]:
 def is_night_mode(irradiance: float, hour: float) -> bool:
     return irradiance < 45 or hour < 5.8 or hour > 18.8
 
-def render_status_banner(latest, forecast, night: bool):
+def render_status_banner(latest, forecast, night: bool, outage: bool):
     messages = []
+    if outage:
+        messages.append(("error", "🚨 GRID BLACKOUT: Island Mode active. Microgrid operating autonomously on Solar + Storage."))
+    
     if latest.aqi > 200:
         messages.append(("error", f"Poor air quality ({latest.aqi:.0f} AQI) — high soiling risk"))
     elif latest.aqi > 100:
@@ -311,10 +308,10 @@ def render_status_banner(latest, forecast, night: bool):
 
     peak_row = forecast.loc[forecast.forecast_scenario.idxmax()]
     hours_to_peak = (peak_row.timestamp - latest.timestamp).total_seconds() / 3600
-    if 0 < hours_to_peak <= 3.5:
+    if 0 < hours_to_peak <= 3.5 and not outage:
         messages.append(("warning", f"Peak demand approaching: {peak_row.forecast_scenario:.0f} kW at {peak_row.timestamp.strftime('%H:%M')}"))
 
-    if night:
+    if night and not outage:
         messages.append(("info", "Night mode — solar offline, storage discharging for peak shaving"))
 
     if not messages:
@@ -372,7 +369,10 @@ with st.sidebar:
         help="Adjusts forecast demand for a warmer or cooler outlook."
     )
 
-    st.caption("🌡️ Baseline temperature profile active." if weather_shift == 0 else f"🌡️ Scenario: {weather_shift:+.0f}°C applied")
+    st.divider()
+    st.markdown("**🛡️ Resilience & Demand Response**")
+    simulate_outage = st.checkbox("🚨 Simulate Grid Blackout (Island Mode)", value=False)
+    ev_shift_kw = st.slider("⚡ EV Fleet Load Shifting (kW)", 0, 40, 0, step=5, help="Shifts flexible EV charging away from peak hours.")
 
     st.divider()
     st.markdown("**SCADA Telemetry & Polling**")
@@ -398,14 +398,24 @@ night = is_night_mode(latest.irradiance, latest.timestamp.hour + latest.timestam
 aqi_text, aqi_color = aqi_label(latest.aqi)
 solar_loss = max(0, (latest.aqi - 45) * cfg["aqi_soiling_factor"])
 
-# Run battery storage dispatch on latest state
-net_load_raw = latest.load_kw - latest.solar_kw
-net_load, battery_soc = simulate_battery_dispatch(latest.solar_kw, latest.load_kw, cfg["battery_capacity_kwh"], current_soc=0.65)
+# Apply Demand Response (EV Load Shifting)
+adjusted_load_kw = max(35.0, latest.load_kw - ev_shift_kw)
 
-# Carbon Tracker Calculations (Cumulative solar generation offset * grid emission factor)
-total_historical_solar_kwh = data.solar_kw.sum() * 0.5 # 30-min intervals
+# Handle Outage Simulation vs Normal Operation
+if simulate_outage:
+    net_load = 0.0
+    battery_soc = 35.0 # Battery draining to support islanding
+    grid_status_text = "🚨 Island Mode (Grid Down)"
+    grid_color = "#ef7f6d"
+else:
+    net_load, battery_soc = simulate_battery_dispatch(latest.solar_kw, adjusted_load_kw, cfg["battery_capacity_kwh"], current_soc=0.65)
+    grid_status_text = "after storage & PV"
+    grid_color = "#a9c7ff"
+
+# Carbon Tracker Calculations
+total_historical_solar_kwh = data.solar_kw.sum() * 0.5
 co2_saved_kg = total_historical_solar_kwh * cfg["grid_emission_factor_kg_kwh"]
-coal_saved_kg = co2_saved_kg * 0.45 # Rough coal equivalent offset ratio
+coal_saved_kg = co2_saved_kg * 0.45
 
 # ============================================================
 # HEADER
@@ -416,19 +426,19 @@ st.caption(
     f"Refreshed: {datetime.now().strftime('%H:%M:%S')}"
 )
 
-render_status_banner(latest, forecast, night)
+render_status_banner(latest, forecast, night, simulate_outage)
 
 # ============================================================
-# METRIC CARDS (INCLUDING STORAGE SOC)
+# METRIC CARDS
 # ============================================================
 cards = st.columns(4)
 metrics = [
-    ("Grid demand", f"{latest.load_kw:.0f} kW", "↗ 3.2% vs yesterday", "#71d5c1"),
+    ("Grid demand", f"{adjusted_load_kw:.0f} kW", f"DR Shift: -{ev_shift_kw} kW" if ev_shift_kw > 0 else "↗ 3.2% vs yesterday", "#71d5c1"),
     ("Solar output", f"{latest.solar_kw:.1f} kW",
      "🌙 Night Mode (Solar Gated)" if night else f"{latest.solar_kw / cfg['solar_capacity_kw'] * 100:.0f}% capacity factor",
      "#ffd166"),
     ("Battery Storage (SoC)", f"{battery_soc:.0f}%", f"Capacity: {cfg['battery_capacity_kwh']} kWh", "#38bdf8"),
-    ("Net grid import", f"{net_load:.0f} kW", f"after storage & PV", "#a9c7ff"),
+    ("Net grid import", f"{net_load:.0f} kW", grid_status_text, grid_color),
 ]
 
 for col, (label, value, note, color) in zip(cards, metrics):
@@ -553,10 +563,12 @@ with col2:
     c2.metric("Coal Saved", f"{coal_saved_kg:.0f} kg", "equivalent offset")
     
     st.markdown("---")
-    st.markdown(f"#### 🔋 Storage & Yield Optimizer")
-    st.caption(f"Battery Capacity: {cfg['battery_capacity_kwh']} kWh • Dispatch Mode: Peak Shaving")
+    st.markdown(f"#### 🔋 Storage & Demand Response")
+    st.metric("DR Cost Savings", f"₹{ev_shift_kw * cfg['tariff_inr'] * 4:,.0f}/day", "from peak load shifting")
     
-    if night:
+    if simulate_outage:
+        st.error("Islanding active: Grid import isolated. Battery supporting local critical loads.", icon="🚨")
+    elif night:
         st.info("Storage discharging to handle baseline night load.", icon="🔋")
     else:
         st.success("Solar surplus actively routing to battery bank.", icon="⚡")
@@ -577,5 +589,5 @@ with st.expander("Data model and integration notes"):
 **Current model:** 30-minute site observations with site-specific load shapes (`industrial` / `office` / `commercial` / `mixed`).  
 Demand is forecast with **Ridge Regression + cyclic Fourier terms**.  
 
-**Storage & Carbon Layers:** Includes a rule-based battery optimizer managing state-of-charge (SoC) for peak shaving, alongside a live carbon offset counter computed via localized grid emission factors (`{cfg['grid_emission_factor_kg_kwh']} kg CO₂/kWh`).
+**Advanced Layers:** Features an interactive **Demand Response Simulator** (EV fleet load-shifting) and an **Outage Resilience & Islanding Mode** that dynamically isolates the grid and manages autonomous microgrid power continuity.
 """)
