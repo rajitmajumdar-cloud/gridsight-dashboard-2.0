@@ -347,33 +347,6 @@ def render_status_banner(latest, forecast, night: bool, outage: bool, autonomy_h
             st.info(text, icon="ℹ️")
 
 # ============================================================
-# CUSTOM CSS
-# ============================================================
-st.markdown("""
-<style>
-.stApp { background: #071522; color: #edf5fb; }
-[data-testid="stSidebar"] { background: #0d2233; }
-.metric-card {
-    background: linear-gradient(135deg, #102e43, #0d2233);
-    border: 1px solid #24506a;
-    border-radius: 14px;
-    padding: 16px;
-    min-height: 115px;
-}
-.metric-label { color: #9bb6c7; font-size: 0.78rem; text-transform: uppercase; letter-spacing: .08em; }
-.metric-value { font-size: 1.8rem; font-weight: 700; margin: 5px 0; }
-.metric-note { font-size: .82rem; }
-h1, h2, h3 { color: #f4fbff !important; }
-.stPlotlyChart {
-    border: 1px solid #1b4057;
-    border-radius: 12px;
-    padding: 6px;
-    background: #0b1d2b;
-}
-</style>
-""", unsafe_allow_html=True)
-
-# ============================================================
 # SIDEBAR
 # ============================================================
 with st.sidebar:
@@ -396,7 +369,7 @@ with st.sidebar:
         simulate_outage = st.checkbox("🚨 Simulate Grid Blackout (Island Mode)", value=False)
         ev_shift_kw = st.slider("⚡ EV Fleet Load Shifting (kW)", 0, 50, 0, step=5)
     else:
-        site = "Pune Industrial Campus"  # Default fallback
+        site = "Pune Industrial Campus"
         cfg = SITES[site]
         simulate_outage = False
         ev_shift_kw = 0
@@ -409,6 +382,39 @@ with st.sidebar:
         st.success(f"Live API connected (WAQI: {int(live_aqi_val)})", icon="🟢")
     else:
         st.info("Simulation mode · Site profile active", icon="ℹ️")
+
+# ============================================================
+# DYNAMIC CSS (REACTS TO ISLAND MODE)
+# ============================================================
+app_bg = "#160b0b" if simulate_outage else "#071522"
+card_bg = "linear-gradient(135deg, #321010, #1d0909)" if simulate_outage else "linear-gradient(135deg, #102e43, #0d2233)"
+card_border = "#7f2a2a" if simulate_outage else "#24506a"
+chart_bg = "#120808" if simulate_outage else "#0b1d2b"
+
+st.markdown(f"""
+<style>
+.stApp {{ background: {app_bg}; color: #edf5fb; transition: background 0.5s ease; }}
+[data-testid="stSidebar"] {{ background: #0d2233; }}
+.metric-card {{
+    background: {card_bg};
+    border: 1px solid {card_border};
+    border-radius: 14px;
+    padding: 16px;
+    min-height: 115px;
+    transition: all 0.5s ease;
+}
+.metric-label {{ color: #9bb6c7; font-size: 0.78rem; text-transform: uppercase; letter-spacing: .08em; }}
+.metric-value {{ font-size: 1.8rem; font-weight: 700; margin: 5px 0; }}
+.metric-note {{ font-size: .82rem; }}
+h1, h2, h3 {{ color: #f4fbff !important; }}
+.stPlotlyChart {{
+    border: 1px solid {card_border};
+    border-radius: 12px;
+    padding: 6px;
+    background: {chart_bg};
+}
+</style>
+""", unsafe_allow_html=True)
 
 # ============================================================
 # PORTFOLIO EXECUTIVE OVERVIEW MODE
@@ -483,7 +489,6 @@ else:
 
     night = is_night_mode(latest.irradiance, latest.timestamp.hour + latest.timestamp.minute / 60)
     aqi_text, aqi_color = aqi_label(latest.aqi)
-    solar_loss = max(0, (latest.aqi - 45) * cfg["aqi_soiling_factor"])
 
     adjusted_load_kw = max(35.0, latest.load_kw - ev_shift_kw)
 
@@ -582,8 +587,8 @@ else:
             template="plotly_dark",
             height=380,
             margin=dict(l=10, r=10, t=25, b=10),
-            paper_bgcolor="#0b1d2b",
-            plot_bgcolor="#0b1d2b",
+            paper_bgcolor=chart_bg,
+            plot_bgcolor=chart_bg,
             legend=dict(orientation="h", y=1.12),
             yaxis_title="kW",
             xaxis_title=None,
@@ -593,7 +598,6 @@ else:
     with right:
         peak_row = forecast.loc[forecast.forecast_scenario_dr.idxmax()]
         delta_peak = peak_row.delta_kw - ev_shift_kw
-        delta_energy = (forecast.forecast_scenario_dr.sum() - forecast.forecast_baseline.sum()) / 2
 
         st.markdown("#### Forecast signal & DR impact")
         st.metric("Expected peak", f"{peak_row.forecast_scenario_dr:.0f} kW",
@@ -629,8 +633,8 @@ else:
             template="plotly_dark",
             height=340,
             margin=dict(l=10, r=10, t=20, b=10),
-            paper_bgcolor="#0b1d2b",
-            plot_bgcolor="#0b1d2b",
+            paper_bgcolor=chart_bg,
+            plot_bgcolor=chart_bg,
             legend=dict(orientation="h", y=1.12),
         )
         fig2.update_yaxes(title_text="Solar kW", secondary_y=False)
