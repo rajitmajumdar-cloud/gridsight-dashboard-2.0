@@ -391,30 +391,30 @@ card_bg = "linear-gradient(135deg, #321010, #1d0909)" if simulate_outage else "l
 card_border = "#7f2a2a" if simulate_outage else "#24506a"
 chart_bg = "#120808" if simulate_outage else "#0b1d2b"
 
-st.markdown(f"""
+st.markdown("""
 <style>
-.stApp {{ background: {app_bg}; color: #edf5fb; transition: background 0.5s ease; }}
-[data-testid="stSidebar"] {{ background: #0d2233; }}
-.metric-card {{
-    background: {card_bg};
-    border: 1px solid {card_border};
+.stApp { background: %s; color: #edf5fb; transition: background 0.5s ease; }
+[data-testid="stSidebar"] { background: #0d2233; }
+.metric-card {
+    background: %s;
+    border: 1px solid %s;
     border-radius: 14px;
     padding: 16px;
     min-height: 115px;
     transition: all 0.5s ease;
 }
-.metric-label {{ color: #9bb6c7; font-size: 0.78rem; text-transform: uppercase; letter-spacing: .08em; }}
-.metric-value {{ font-size: 1.8rem; font-weight: 700; margin: 5px 0; }}
-.metric-note {{ font-size: .82rem; }}
-h1, h2, h3 {{ color: #f4fbff !important; }}
-.stPlotlyChart {{
-    border: 1px solid {card_border};
+.metric-label { color: #9bb6c7; font-size: 0.78rem; text-transform: uppercase; letter-spacing: .08em; }
+.metric-value { font-size: 1.8rem; font-weight: 700; margin: 5px 0; }
+.metric-note { font-size: .82rem; }
+h1, h2, h3 { color: #f4fbff !important; }
+.stPlotlyChart {
+    border: 1px solid %s;
     border-radius: 12px;
     padding: 6px;
-    background: {chart_bg};
+    background: %s;
 }
 </style>
-""", unsafe_allow_html=True)
+""" % (app_bg, card_bg, card_border, card_border, chart_bg), unsafe_allow_html=True)
 
 # ============================================================
 # PORTFOLIO EXECUTIVE OVERVIEW MODE
@@ -662,5 +662,5 @@ else:
         "📥 Download Forecast CSV",
         data=csv,
         file_name=f"gridsight_forecast_{site.replace(' ', '_')}.csv",
-        mime="text/csv",
+        mime="text/css",
     )
