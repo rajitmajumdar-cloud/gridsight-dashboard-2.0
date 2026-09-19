@@ -97,7 +97,6 @@ WAQI_TOKEN = get_waqi_token()
 # SQLITE SESSION TELEMETRY LOG
 # NOTE: Streamlit Cloud's filesystem is ephemeral — this log persists only
 # for the life of the running container and resets on redeploy/restart.
-# It is a within-session telemetry trail, not durable long-term storage.
 # ============================================================
 @st.cache_resource
 def get_db_connection():
@@ -265,8 +264,6 @@ def generate_site_data(days: int, site_name: str, real_temp: float | None = None
 
 # ============================================================
 # LIVE AQI (WAQI) — returns the real reading, unmodified.
-# Fallback values (used only if the token is missing or the call fails)
-# are clearly distinct per city and never presented as "live".
 # ============================================================
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_live_aqi(city: str, token: str | None) -> tuple[float, bool]:
@@ -339,8 +336,6 @@ def forecast_load(data: pd.DataFrame, horizon_steps: int, weather_shift: float =
         })
 
     baseline_pred = model.predict(make_X(baseline_temp))
-    # Scenario is pure model output at the shifted temperature — no manual
-    # bonus added on top, so the chart reflects what the model actually learned.
     scenario_pred = model.predict(make_X(baseline_temp + weather_shift))
 
     horizon_factor = np.linspace(1.0, 1.45, horizon_steps)
@@ -365,18 +360,9 @@ def forecast_load(data: pd.DataFrame, horizon_steps: int, weather_shift: float =
     return forecast_df, meta
 
 # ============================================================
-# SMART BATTERY DISPATCH STRATEGY (ARBITRAGE & PEAK SHAVING)
-# Stateful: current_soc is read from / written back to st.session_state
-# by the caller, so charge level actually carries forward between reruns
-# instead of resetting to a fixed value every time.
+# SMART BATTERY DISPATCH STRATEGY
 # ============================================================
 def simulate_smart_battery_dispatch(solar_kw: float, load_kw: float, hour: float, battery_capacity_kwh: float, current_soc: float):
-    """
-    Smart Dispatch Logic:
-    - Peak hours (17:00 to 22:00): Aggressive discharge to shave peak and avoid high tariffs.
-    - Solar surplus hours: Charge battery from PV excess.
-    - Off-peak/Night: Maintain or gentle trickle.
-    """
     net_power = load_kw - solar_kw
     soc_kwh = current_soc * battery_capacity_kwh
     is_peak_hour = 17.0 <= hour <= 22.0
@@ -420,15 +406,10 @@ def is_night_mode(irradiance: float, hour: float) -> bool:
 
 # ============================================================
 # RECOMMENDATION ENGINE
-# Rule-based (not ML): looks for meaningfully elevated demand specifically
-# inside the evening peak-tariff window (independent of where the forecast's
-# single global maximum happens to fall — a Ridge/Fourier fit can place that
-# anywhere in the horizon) and, if found, suggests moving a fixed EV-charging
-# block to the cheapest off-peak hour, quantified via the TOU assumption above.
 # ============================================================
 def generate_recommendation(forecast: pd.DataFrame, cfg: dict, current_ev_shift_kw: float) -> dict | None:
     if current_ev_shift_kw > 0:
-        return None  # a shift is already applied — don't suggest stacking another
+        return None
 
     peak_window = forecast[(forecast.timestamp.dt.hour >= PEAK_HOUR_START) & (forecast.timestamp.dt.hour <= PEAK_HOUR_END)]
     off_peak = forecast[(forecast.timestamp.dt.hour < PEAK_HOUR_START) | (forecast.timestamp.dt.hour > PEAK_HOUR_END)]
@@ -438,17 +419,13 @@ def generate_recommendation(forecast: pd.DataFrame, cfg: dict, current_ev_shift_
     from_row = peak_window.loc[peak_window.forecast_scenario_dr.idxmax()]
     to_row = off_peak.loc[off_peak.forecast_scenario_dr.idxmin()]
 
-    # Only worth recommending if the peak-window demand is meaningfully above
-    # what's achievable off-peak — otherwise there's nothing worth shifting.
     if from_row.forecast_scenario_dr < to_row.forecast_scenario_dr + 10:
         return None
 
-    suggested_shift_kw = 30.0  # a typical EV fleet charging block; capped well under the 50kW slider max
+    suggested_shift_kw = 30.0
     hours_shifted = PEAK_HOUR_END - PEAK_HOUR_START
     peak_premium_per_kwh = cfg["tariff_inr"] * (PEAK_TARIFF_MULTIPLIER - 1)
     savings_inr = suggested_shift_kw * peak_premium_per_kwh * hours_shifted
-    # CO2 estimate assumes off-peak grid draw is modestly cleaner than peak
-    # (peaker plants skew the peak-hour mix) — a rough, clearly-labeled proxy.
     co2_avoided_kg = suggested_shift_kw * hours_shifted * cfg["grid_emission_factor_kg_kwh"] * 0.10
 
     return {
@@ -460,57 +437,39 @@ def generate_recommendation(forecast: pd.DataFrame, cfg: dict, current_ev_shift_
     }
 
 def apply_recommendation(site_name: str, shift_kw: float, savings_inr: float, co2_avoided_kg: float):
-    # Runs as an on_click callback (before the script reruns from the top),
-    # so the slider's session_state can be updated safely here — doing this
-    # inline after the widget has already rendered in the same run raises
-    # StreamlitWidgetAlreadyInstantiatedError.
     st.session_state["ev_shift_kw_slider"] = int(shift_kw)
     log_decision(site_name, shift_kw, savings_inr, co2_avoided_kg)
 
-# ============================================================
-# ONE-CLICK SCENARIO PRESETS — same callback-before-rerun pattern as
-# apply_recommendation above, driving the existing sidebar controls
-# directly so nothing downstream needs special-casing.
-# ============================================================
-def trigger_dust_storm():
-    st.session_state["dust_storm_checkbox"] = True
-
-def trigger_heatwave():
-    st.session_state["weather_shift_slider"] = 8
-
-def trigger_blackout():
-    st.session_state["simulate_outage_checkbox"] = True
-
-def reset_all_scenarios():
-    st.session_state["dust_storm_checkbox"] = False
-    st.session_state["weather_shift_slider"] = 0
-    st.session_state["simulate_outage_checkbox"] = False
-    st.session_state["ev_shift_kw_slider"] = 0
-    # Also restore battery charge for every site — otherwise a battery drained
-    # during a blackout test would confusingly stay drained in "normal" mode.
-    for name in SITES:
-        st.session_state.battery_soc[name] = 65.0
-
-def render_status_banner(latest, forecast, night: bool, outage: bool, autonomy_hours: float):
+def render_status_banner(latest, forecast, night: bool, outage: bool, autonomy_hours: float, scenario: str):
     messages = []
-    if outage:
+    if outage or scenario == "blackout":
         if autonomy_hours > 4.0:
             messages.append(("error", f"🚨 ISLAND MODE ACTIVE: Grid offline. Autonomous battery & solar reserve strong ({autonomy_hours:.1f}h autonomy)."))
         else:
             messages.append(("error", f"🚨 CRITICAL ISLAND MODE: Low reserve! Estimated autonomy only {autonomy_hours:.1f}h. Shed non-critical loads!"))
+    elif scenario == "duststorm":
+        messages.append(("warning", "🌪️ DUST STORM ACTIVE: Particulate haze choking solar panels — soiling derates amplified."))
+    elif scenario == "heatwave":
+        messages.append(("warning", "🌡️ HEATWAVE ACTIVE: Thermal spike driving up HVAC and cooling loads across campus."))
+    elif scenario == "surge":
+        messages.append(("info", "⚡ SURGE & OVERLOAD ACTIVE: High-voltage electrical load spike simulating industrial equipment test."))
+    elif scenario == "midnight":
+        messages.append(("info", "🌙 MIDNIGHT PEAK ACTIVE: Solar offline, nocturnal storage arbitrage operating at peak capacity."))
 
-    if latest.aqi > 200:
+    if latest.aqi > 200 and scenario != "duststorm":
         messages.append(("error", f"Poor air quality ({latest.aqi:.0f} AQI) — high soiling risk"))
-    elif latest.aqi > 100:
+    elif latest.aqi > 100 and scenario != "duststorm":
         messages.append(("warning", f"Moderate AQI ({latest.aqi:.0f}) — monitor soiling"))
 
-    peak_row = forecast.loc[forecast.forecast_scenario.idxmax()]
-    hours_to_peak = (peak_row.timestamp - latest.timestamp).total_seconds() / 3600
-    if 0 < hours_to_peak <= 3.5 and not outage:
-        messages.append(("warning", f"Peak demand approaching: {peak_row.forecast_scenario:.0f} kW at {peak_row.timestamp.strftime('%H:%M')}"))
-
-    if night and not outage:
-        messages.append(("info", "Night mode — solar offline, storage discharging for peak shaving"))
+    # These two only apply when no scenario is overriding the story being told —
+    # otherwise they'd compete with (and confuse) the active scenario message.
+    if scenario == "normal":
+        peak_row = forecast.loc[forecast.forecast_scenario.idxmax()]
+        hours_to_peak = (peak_row.timestamp - latest.timestamp).total_seconds() / 3600
+        if 0 < hours_to_peak <= 3.5 and not outage:
+            messages.append(("warning", f"Peak demand approaching: {peak_row.forecast_scenario:.0f} kW at {peak_row.timestamp.strftime('%H:%M')}"))
+        if night and not outage:
+            messages.append(("info", "Night mode — solar offline, storage discharging for peak shaving"))
 
     if not messages:
         st.success("System Status Normal: All microgrid parameters within optimal range", icon="✅")
@@ -524,18 +483,35 @@ def render_status_banner(latest, forecast, night: bool, outage: bool, autonomy_h
             st.info(text, icon="ℹ️")
 
 # ============================================================
-# SESSION STATE — per-site battery charge, carried across reruns.
-# Scenario-controlled widget defaults are also seeded here (once) rather
-# than passed as a `value=` kwarg on the widget itself, since a widget
-# with both a `value=` and a callback-set session_state entry triggers a
-# (harmless but noisy) Streamlit policy warning.
+# SESSION STATE
+# Scenario-controlled widget defaults are seeded here (once) rather than
+# passed as a `value=` kwarg on the widget itself, since a widget with both
+# a `value=` and a callback-set session_state entry triggers a (harmless
+# but noisy) Streamlit policy warning.
 # ============================================================
 if "battery_soc" not in st.session_state:
     st.session_state.battery_soc = {name: 65.0 for name in SITES}
+if "active_scenario" not in st.session_state:
+    st.session_state.active_scenario = "normal"
 st.session_state.setdefault("weather_shift_slider", 0)
 st.session_state.setdefault("simulate_outage_checkbox", False)
-st.session_state.setdefault("dust_storm_checkbox", False)
 st.session_state.setdefault("ev_shift_kw_slider", 0)
+
+def set_scenario(name: str):
+    st.session_state.active_scenario = name
+    st.session_state["simulate_outage_checkbox"] = (name == "blackout")
+    if name == "heatwave":
+        st.session_state["weather_shift_slider"] = 8
+
+def reset_all_scenarios():
+    st.session_state.active_scenario = "normal"
+    st.session_state["simulate_outage_checkbox"] = False
+    st.session_state["weather_shift_slider"] = 0
+    st.session_state["ev_shift_kw_slider"] = 0
+    # Also restore battery charge for every site — otherwise a battery drained
+    # during a blackout test would confusingly stay drained in "normal" mode.
+    for name in SITES:
+        st.session_state.battery_soc[name] = 65.0
 
 # ============================================================
 # SIDEBAR
@@ -553,8 +529,7 @@ with st.sidebar:
 
     if view_mode == "Single-Site Operations":
         site = st.selectbox(
-            "Site",
-            list(SITES.keys()),
+            "Site", list(SITES.keys()),
             help="Select which regional campus control room to inspect.",
         )
         cfg = SITES[site]
@@ -578,10 +553,6 @@ with st.sidebar:
             "🚨 Simulate Grid Blackout (Island Mode)", key="simulate_outage_checkbox",
             help="Cuts utility grid input to test autonomous microgrid survival on local solar and battery storage.",
         )
-        dust_storm_active = st.checkbox(
-            "🌪️ Simulate a Dust Storm", key="dust_storm_checkbox",
-            help="Spikes AQI to a severe dust-storm level and dramatically derates solar output via heavy panel soiling — a stress-test scenario, not calibrated real-world physics.",
-        )
         ev_shift_kw = st.slider(
             "⚡ EV Fleet Load Shifting (kW)", 0, 50, step=5, key="ev_shift_kw_slider",
             help="Defer flexible industrial or EV charging loads to flatten peak demand and reduce electricity bills.",
@@ -590,7 +561,6 @@ with st.sidebar:
         site = "Pune Industrial Campus"
         cfg = SITES[site]
         simulate_outage = False
-        dust_storm_active = False
         ev_shift_kw = 0
         weather_shift = 0
 
@@ -612,12 +582,39 @@ with st.sidebar:
         st.info("Weather baseline: 28.0°C", icon="ℹ️")
 
 # ============================================================
-# DYNAMIC CSS (REACTS TO ISLAND MODE)
+# SCENARIO STATE — reconciled bidirectionally with the sidebar checkbox,
+# so manually checking OR unchecking "Simulate Grid Blackout" always wins
+# and a stale "blackout" scenario can never survive an unchecked box.
 # ============================================================
-app_bg = "#160b0b" if simulate_outage else "#071522"
-card_bg = "linear-gradient(135deg, #321010, #1d0909)" if simulate_outage else "linear-gradient(135deg, #102e43, #0d2233)"
-card_border = "#7f2a2a" if simulate_outage else "#24506a"
-chart_bg = "#120808" if simulate_outage else "#0b1d2b"
+scenario = st.session_state.active_scenario
+if view_mode == "Single-Site Operations":
+    if simulate_outage and scenario != "blackout":
+        scenario = "blackout"
+        st.session_state.active_scenario = "blackout"
+    elif not simulate_outage and scenario == "blackout":
+        scenario = "normal"
+        st.session_state.active_scenario = "normal"
+else:
+    # The scenario/theme system only exists in Single-Site view — never let
+    # a scenario picked there bleed into the Portfolio view's appearance.
+    scenario = "normal"
+
+# ============================================================
+# DYNAMIC SCENARIO THEME & STYLING MAPPING
+# ============================================================
+if scenario == "blackout":
+    app_bg, card_bg, card_border, chart_bg = "#160b0b", "linear-gradient(135deg, #321010, #1d0909)", "#7f2a2a", "#120808"
+    simulate_outage = True
+elif scenario == "duststorm":
+    app_bg, card_bg, card_border, chart_bg = "#1f1807", "linear-gradient(135deg, #42320b, #211906)", "#a67c1e", "#141004"
+elif scenario == "heatwave":
+    app_bg, card_bg, card_border, chart_bg = "#221108", "linear-gradient(135deg, #4a220d, #241107)", "#a84318", "#170a04"
+elif scenario == "surge":
+    app_bg, card_bg, card_border, chart_bg = "#051f11", "linear-gradient(135deg, #0f3d24, #082617)", "#10b981", "#03140b"
+elif scenario == "midnight":
+    app_bg, card_bg, card_border, chart_bg = "#0f0c1b", "linear-gradient(135deg, #231942, #16102d)", "#7c3aed", "#0a0713"
+else:
+    app_bg, card_bg, card_border, chart_bg = "#071522", "linear-gradient(135deg, #102e43, #0d2233)", "#24506a", "#0b1d2b"
 
 st.markdown("""
 <style>
@@ -664,7 +661,7 @@ h1, h2, h3 { color: #f4fbff !important; }
 """ % (app_bg, card_bg, card_border, card_border, chart_bg), unsafe_allow_html=True)
 
 # ============================================================
-# PORTFOLIO EXECUTIVE OVERVIEW MODE (WITH REAL ECONOMICS)
+# PORTFOLIO EXECUTIVE OVERVIEW MODE
 # ============================================================
 if view_mode == "🌐 Portfolio Executive Overview":
     st.markdown("# 🌐 Portfolio Executive Command")
@@ -752,30 +749,35 @@ if view_mode == "🌐 Portfolio Executive Overview":
     st.plotly_chart(fig_port, use_container_width=True)
 
 # ============================================================
-# SINGLE-SITE OPERATIONS MODE (WITH SMART DISPATCH & HISTORY)
+# SINGLE-SITE OPERATIONS MODE
 # ============================================================
 else:
     data = generate_site_data(days, site, real_temp=real_temp)
+    if scenario == "duststorm":
+        live_aqi_val = 380.0
+
     data.loc[data.index[-1], "aqi"] = live_aqi_val
+    if scenario == "duststorm":
+        data.loc[data.index[-1], "solar_kw"] *= 0.25
 
     latest = data.iloc[-1]
-    if dust_storm_active:
-        # Scenario stress-test override — deliberately more severe than the
-        # calibrated aqi_soiling_factor model, so the effect reads clearly in
-        # a live demo. Only the current-snapshot row is overridden; the
-        # historical chart and forecast are untouched by this toggle.
-        latest = latest.copy()
-        latest["aqi"] = 380.0
-        latest["solar_kw"] = latest["solar_kw"] * 0.25
     current_hour = latest.timestamp.hour + latest.timestamp.minute / 60
+    if scenario == "midnight":
+        current_hour = 23.0
+
     forecast, meta = forecast_load(data, horizon_hours * 2, weather_shift)
+    if scenario == "surge":
+        forecast["forecast_scenario"] *= 1.25
+        forecast["delta_kw"] = forecast["forecast_scenario"] - forecast["forecast_baseline"]
 
     forecast["forecast_scenario_dr"] = np.maximum(35.0, forecast["forecast_scenario"] - ev_shift_kw)
 
-    night = is_night_mode(latest.irradiance, current_hour)
+    night = is_night_mode(latest.irradiance, current_hour) or scenario == "midnight"
     aqi_text, aqi_color = aqi_label(latest.aqi)
 
     adjusted_load_kw = max(35.0, latest.load_kw - ev_shift_kw)
+    if scenario == "surge":
+        adjusted_load_kw *= 1.25
 
     current_soc_pct = st.session_state.battery_soc.get(site, 65.0)
     current_battery_kwh = (current_soc_pct / 100.0) * cfg["battery_capacity_kwh"]
@@ -785,7 +787,7 @@ else:
     # so it is treated as an equivalent kW figure in this coverage estimate.
     critical_load_coverage_pct = min(100.0, (latest.solar_kw + (cfg["battery_capacity_kwh"] * 0.25)) / adjusted_load_kw * 100)
 
-    if simulate_outage:
+    if simulate_outage or scenario == "blackout":
         net_load = 0.0
         time_step_hours = 0.5  # matches the 30-min data resolution
         drain_kwh = net_critical_load * time_step_hours
@@ -819,37 +821,44 @@ else:
         f"Refreshed: {datetime.now().strftime('%H:%M:%S')}"
     )
 
-    st.markdown("#### 🎮 One-Click Scenario Playground")
-    st.caption("No sliders to hunt for — hit a button and watch the microgrid react instantly.")
-    p_col1, p_col2, p_col3, p_col4 = st.columns([1, 1, 1.2, 0.7])
-    with p_col1:
-        st.button(
-            "🌪️ Simulate a Dust Storm", use_container_width=True, on_click=trigger_dust_storm,
-            help="Spikes AQI to a severe dust-storm level and heavily derates solar output via panel soiling.",
-        )
-    with p_col2:
-        st.button(
-            "🌡️ Simulate a 45°C Heatwave", use_container_width=True, on_click=trigger_heatwave,
-            help="Maxes out the Temperature scenario slider and re-runs the ML demand forecast under that heat load.",
-        )
-    with p_col3:
+    # ============================================================
+    # ONE-CLICK CINEMATIC SCENARIO PLAYGROUND DECK
+    # ============================================================
+    st.markdown("""
+    <div style="background: linear-gradient(135deg, #1e293b, #0f172a); border: 2px solid #38bdf8; border-radius: 14px; padding: 16px; margin: 15px 0 20px 0;">
+        <h4 style="margin: 0; color: #38bdf8; font-size: 1.055rem;">🎮 One-Click Scenario Playground</h4>
+        <p style="margin: 4px 0 0 0; color: #cbd5e1; font-size: 0.88rem;">No sliders to hunt for — hit a button and watch the microgrid and UI vibe react instantly.</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    b_col1, b_col2, b_col3, b_col4, b_col5, b_col6 = st.columns(6)
+    with b_col1:
+        st.button("🌪️ Dust Storm", use_container_width=True, on_click=set_scenario, args=("duststorm",),
+                   help="Spikes AQI to a severe dust-storm level and heavily derates solar output via panel soiling.")
+    with b_col2:
+        st.button("🌡️ Heatwave", use_container_width=True, on_click=set_scenario, args=("heatwave",),
+                   help="Maxes out the Temperature scenario slider and re-runs the ML demand forecast under that heat load.")
+    with b_col3:
+        st.button("⚡ Power Surge", use_container_width=True, on_click=set_scenario, args=("surge",),
+                   help="Simulates an industrial equipment test spiking demand 25% above forecast.")
+    with b_col4:
+        st.button("🌙 Midnight", use_container_width=True, on_click=set_scenario, args=("midnight",),
+                   help="Jumps the clock to 23:00 — solar goes offline and the battery carries the full load.")
+    with b_col5:
         st.markdown('<div class="mvp-badge">🔴 What happens if the city grid dies right now?</div>', unsafe_allow_html=True)
-        st.button(
-            "🚨 Test Microgrid Survivability", use_container_width=True, on_click=trigger_blackout,
-            help="The ultimate stress test: cuts the grid entirely and starts the live Autonomy Scorecard below.",
-        )
-    with p_col4:
-        st.button(
-            "↺ Reset", use_container_width=True, on_click=reset_all_scenarios,
-            help="Clears every active scenario and returns to normal operations.",
-        )
+        st.button("🚨 Test Microgrid Survivability", use_container_width=True, type="primary",
+                   on_click=set_scenario, args=("blackout",),
+                   help="The ultimate stress test: cuts the grid entirely and starts the live Autonomy Scorecard below.")
+    with b_col6:
+        st.button("↺ Reset", use_container_width=True, on_click=reset_all_scenarios,
+                   help="Clears every active scenario, restores battery charge, and returns to normal operations.")
 
-    render_status_banner(latest, forecast, night, simulate_outage, autonomy_hours)
+    render_status_banner(latest, forecast, night, simulate_outage, autonomy_hours, scenario)
 
-    if dust_storm_active:
+    if scenario == "duststorm":
         st.caption("🌪️ **Dust Storm scenario active** — the AQI and solar figures above are dramatized for this demo, not live or calibrated-simulation telemetry.")
 
-    if simulate_outage:
+    if simulate_outage or scenario == "blackout":
         if autonomy_hours >= 4.0:
             verdict, verdict_color = "🏆 SURVIVED — Grid-Independent", "#36c98b"
         elif autonomy_hours >= 1.0:
@@ -873,7 +882,7 @@ else:
         )
         st.caption("This countdown recalculates every time you touch a control while blackout mode is active — drag any slider and watch it drop.")
 
-    recommendation = None if simulate_outage else generate_recommendation(forecast, cfg, ev_shift_kw)
+    recommendation = None if (simulate_outage or scenario == "blackout") else generate_recommendation(forecast, cfg, ev_shift_kw)
     if recommendation:
         rec_col1, rec_col2 = st.columns([3.2, 1])
         with rec_col1:
