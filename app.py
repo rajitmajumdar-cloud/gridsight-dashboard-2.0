@@ -7,7 +7,16 @@ and physical solar/thermal derating models.
 from datetime import datetime
 import numpy as np
 import pandas as pd
-import pytz
+
+# Standard library timezone support (Python 3.9+) with pytz fallback
+try:
+    from zoneinfo import ZoneInfo
+    def get_tz(tz_str):
+        return ZoneInfo(tz_str)
+except ImportError:
+    import pytz
+    def get_tz(tz_str):
+        return pytz.timezone(tz_str)
 
 # Site Configurations & Physical Parameters
 SITE_CONFIGS = {
@@ -66,7 +75,7 @@ def generate_site_data(site_name: str, days: int = 30) -> pd.DataFrame:
     Incorporates relative humidity, thermal cell temp models, and soiling heuristics.
     """
     config = SITE_CONFIGS.get(site_name, SITE_CONFIGS["Pune Campus"])
-    tz = pytz.timezone(config["timezone"])
+    tz = get_tz(config["timezone"])
 
     end_time = datetime.now(tz).replace(minute=0, second=0, microsecond=0)
     periods = days * 24 * 2  # 30-min resolution
@@ -136,7 +145,7 @@ def generate_site_data(site_name: str, days: int = 30) -> pd.DataFrame:
     max_kw = config["max_battery_kw"]
     
     soc_kwh = np.zeros(periods)
-    battery_kw = np.zeros(periods) # + = discharging to load, - = charging
+    battery_kw = np.zeros(periods)  # + = discharging to load, - = charging
     curr_soc = battery_capacity_kwh * 0.5
 
     net_unbuffered = simulated_load_kw - actual_solar_kw
